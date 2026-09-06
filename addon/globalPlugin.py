@@ -6,8 +6,12 @@
 
 import os
 import json
+import time
+import tempfile
+import threading
 import webbrowser
 import urllib.parse
+import urllib.request
 
 import wx
 import api
@@ -15,6 +19,7 @@ import ui
 import gui
 import config
 import languageHandler
+import addonHandler
 import globalPluginHandler
 from scriptHandler import script
 
@@ -113,6 +118,23 @@ STRINGS = {
 	"contactDeveloperButton": {"ar": "تواصل مع المطور عبر البريد الإلكتروني", "en": "Contact the developer by email"},
 	"helpDialogTitle": {"ar": "مساعدة إضافة قادرين", "en": "Qadreen add-on help"},
 	"helpCloseButton": {"ar": "إغلاق", "en": "Close"},
+	"msgUpdateAvailable": {
+		"ar": "يتوفر تحديث جديد لإضافة قادرين: الإصدار {}. يمكنك تنزيله من صفحة المشروع على GitHub.",
+		"en": "A new Qadreen update is available: version {}. You can download it from the project's GitHub page."
+	},
+	"updateAvailableTitle": {"ar": "تحديث جديد متاح", "en": "New update available"},
+	"msgUpdateConfirm": {
+		"ar": "يتوفر إصدار جديد من إضافة قادرين: {}. هل تريد تنزيله وتثبيته الآن؟ بياناتك ستبقى محفوظة.",
+		"en": "A new Qadreen version is available: {}. Download and install it now? Your data will be kept."
+	},
+	"updateInstalledTitle": {"ar": "اكتمل التحديث", "en": "Update complete"},
+	"msgUpdateInstalledRestart": {
+		"ar": "تم تثبيت التحديث بنجاح، وبياناتك محفوظة كما هي. يجب إعادة تشغيل NVDA لتفعيل النسخة الجديدة. إعادة التشغيل الآن؟",
+		"en": "The update was installed successfully, and your data has been kept. NVDA must restart to activate the new version. Restart now?"
+	},
+	"msgUpdateAssetNotFound": {"ar": "تعذر إيجاد ملف التثبيت في هذا الإصدار", "en": "Could not find the installer file in this release"},
+	"msgUpdateDownloadFailed": {"ar": "تعذر تنزيل التحديث", "en": "Failed to download the update"},
+	"msgUpdateInstallFailed": {"ar": "تعذر تثبيت التحديث", "en": "Failed to install the update"},
 }
 
 
@@ -246,6 +268,159 @@ def saveData(data):
 		return True
 	except OSError:
 		return False
+
+
+# =====================================================================
+# فحص التحديثات: مرة واحدة فقط عند كل بدء تشغيل لـNVDA، يتحقق من أحدث
+# إصدار مستقر منشور على GitHub (وليس أي نسخة تجريبية أو مسودة، لأن نقطة
+# نهاية "أحدث إصدار" في GitHub تستثني هذه النسخ تلقائياً)
+# =====================================================================
+
+GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/saedmohamedn2210-create/Qadreen/releases/latest"
+
+# مكان النسخة الاحتياطية لبيانات المستخدم أثناء التحديث: خارج مجلد
+# الإضافة تماماً (في مجلد المستخدم)، حتى تنجو من استبدال مجلد الإضافة
+# بالكامل أثناء التثبيت، وتُستعاد تلقائياً عند أول تشغيل بعد إعادة التشغيل
+UPDATE_BACKUP_PATH = os.path.join(os.path.expanduser("~"), ".qadreen_data_backup.json")
+
+
+def parseVersion(versionString):
+	"""تحويل نص إصدار مثل '1.2' أو 'v1.2' إلى tuple أرقام لمقارنة صحيحة"""
+	parts = []
+	for part in versionString.strip().lstrip("vV").split("."):
+		digits = "".join(ch for ch in part if ch.isdigit())
+		parts.append(int(digits) if digits else 0)
+	return tuple(parts)
+
+
+def restoreDataBackupIfNeeded():
+	"""تُستدعى عند بدء تشغيل الإضافة: لو وُجدت نسخة احتياطية من data.json
+	تركها تحديث سابق (لأن حزمة التثبيت الجديدة استبدلت data.json بنسختها
+	التجريبية الافتراضية)، تُستعاد بيانات المستخدم الحقيقية فوراً، ثم تُحذف
+	النسخة الاحتياطية حتى لا تُعاد مرة أخرى في المرات القادمة."""
+	if not os.path.isfile(UPDATE_BACKUP_PATH):
+		return
+	try:
+		with open(UPDATE_BACKUP_PATH, "r", encoding="utf-8") as f:
+			backupData = json.load(f)
+		with open(DATA_FILE, "w", encoding="utf-8") as f:
+			json.dump(backupData, f, ensure_ascii=False, indent="\t")
+		os.remove(UPDATE_BACKUP_PATH)
+	except (OSError, json.JSONDecodeError):
+		pass
+
+
+def promptRestart():
+	"""تُعرض بعد اكتمال التثبيت: تسأل المستخدم إن كان يريد إعادة تشغيل
+	NVDA الآن لتفعيل النسخة الجديدة. تُستدعى دائماً عبر wx.CallAfter من
+	الخيط الرئيسي، وتستخدم gui.mainFrame مع prePopup/postPopup كما يتطلب
+	NVDA لأي نافذة modal تُعرض من سياق خارج نافذة مفتوحة فعلاً للإضافة."""
+	gui.mainFrame.prePopup()
+	try:
+		restartNow = confirmYesNo(
+			gui.mainFrame,
+			tr("updateInstalledTitle"),
+			tr("msgUpdateInstalledRestart")
+		)
+	finally:
+		gui.mainFrame.postPopup()
+	if restartNow:
+		import core
+		core.restart()
+
+
+def downloadAndInstallUpdate(releaseData):
+	"""تعمل داخل خيط منفصل: تنزيل حزمة التحديث، نسخ بيانات المستخدم
+	الحالية احتياطياً، تثبيت الحزمة الجديدة، ثم عرض طلب إعادة التشغيل."""
+	asset = None
+	for a in releaseData.get("assets", []):
+		if a.get("name", "").endswith(".nvda-addon"):
+			asset = a
+			break
+	if asset is None:
+		wx.CallAfter(ui.message, tr("msgUpdateAssetNotFound"))
+		return
+
+	tempPath = os.path.join(tempfile.gettempdir(), "Qadreen_update.nvda-addon")
+	try:
+		request = urllib.request.Request(
+			asset["browser_download_url"],
+			headers={"User-Agent": "Qadreen-NVDA-Addon"}
+		)
+		with urllib.request.urlopen(request, timeout=60) as response:
+			fileData = response.read()
+		with open(tempPath, "wb") as outFile:
+			outFile.write(fileData)
+	except Exception:
+		wx.CallAfter(ui.message, tr("msgUpdateDownloadFailed"))
+		return
+
+	# نسخ بيانات المستخدم الحالية لمكان آمن خارج مجلد الإضافة قبل التثبيت،
+	# لأن التثبيت سيستبدل مجلد الإضافة بالكامل بما فيه data.json التجريبي
+	try:
+		if os.path.isfile(DATA_FILE):
+			with open(DATA_FILE, "r", encoding="utf-8") as src:
+				currentDataText = src.read()
+			with open(UPDATE_BACKUP_PATH, "w", encoding="utf-8") as dst:
+				dst.write(currentDataText)
+	except OSError:
+		pass
+
+	try:
+		bundle = addonHandler.AddonBundle(tempPath)
+		addonHandler.installAddonBundle(bundle)
+	except Exception:
+		wx.CallAfter(ui.message, tr("msgUpdateInstallFailed"))
+		return
+
+	wx.CallAfter(promptRestart)
+
+
+def onUpdateFound(releaseData, latestTag):
+	"""تُستدعى عبر wx.CallAfter من خيط الفحص: تعرض تأكيداً بسيطاً (نعم/لا)
+	على المستخدم، وعند الموافقة فقط يبدأ التنزيل والتثبيت تلقائياً."""
+	gui.mainFrame.prePopup()
+	try:
+		proceed = confirmYesNo(
+			gui.mainFrame,
+			tr("updateAvailableTitle"),
+			tr("msgUpdateConfirm", latestTag)
+		)
+	finally:
+		gui.mainFrame.postPopup()
+	if proceed:
+		threading.Thread(target=downloadAndInstallUpdate, args=(releaseData,), daemon=True).start()
+
+
+def checkForUpdateInBackground():
+	"""تعمل داخل خيط منفصل حتى لا تُجمّد NVDA أثناء انتظار الاتصال بالشبكة"""
+	try:
+		# تأخير بسيط حتى لا تتزاحم الرسالة الصوتية مع إعلانات بدء تشغيل NVDA
+		time.sleep(8)
+
+		try:
+			addon = addonHandler.getCodeAddon()
+			currentVersion = addon.manifest["version"]
+		except Exception:
+			return
+
+		request = urllib.request.Request(
+			GITHUB_LATEST_RELEASE_API,
+			headers={"Accept": "application/vnd.github+json", "User-Agent": "Qadreen-NVDA-Addon"}
+		)
+		with urllib.request.urlopen(request, timeout=10) as response:
+			releaseData = json.loads(response.read().decode("utf-8"))
+
+		latestTag = releaseData.get("tag_name", "")
+		if not latestTag:
+			return
+
+		if parseVersion(latestTag) > parseVersion(currentVersion):
+			wx.CallAfter(onUpdateFound, releaseData, latestTag)
+	except Exception:
+		# فشل الاتصال بالشبكة أو أي خطأ آخر: نتجاهله بصمت تماماً، حتى لا
+		# نزعج المستخدم برسائل خطأ عند غياب الإنترنت مثلاً
+		pass
 
 
 def mergeData(target, source):
@@ -1303,11 +1478,13 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
+		restoreDataBackupIfNeeded()
 		self.data = loadData()
 		self._dialog = None
 		self._helpDialog = None
 		if QadreenSettingsPanel not in gui.NVDASettingsDialog.categoryClasses:
 			gui.NVDASettingsDialog.categoryClasses.append(QadreenSettingsPanel)
+		threading.Thread(target=checkForUpdateInBackground, daemon=True).start()
 
 	@script(
 		# الوصف يُبنى ديناميكياً باللغة الحالية عند تسجيل الاختصار في Input Gestures
