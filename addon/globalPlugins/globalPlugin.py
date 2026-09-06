@@ -135,6 +135,10 @@ STRINGS = {
 	"msgUpdateAssetNotFound": {"ar": "تعذر إيجاد ملف التثبيت في هذا الإصدار", "en": "Could not find the installer file in this release"},
 	"msgUpdateDownloadFailed": {"ar": "تعذر تنزيل التحديث", "en": "Failed to download the update"},
 	"msgUpdateInstallFailed": {"ar": "تعذر تثبيت التحديث", "en": "Failed to install the update"},
+	"createNewChoice": {"ar": "إنشاء جديد...", "en": "Create new..."},
+	"quickAddGroupTitle": {"ar": "اختر المجموعة", "en": "Choose group"},
+	"quickAddCategoryTitle": {"ar": "اختر الفئة", "en": "Choose category"},
+	"msgClipboardEmpty": {"ar": "لا يوجد نص في الحافظة، انسخ الرابط أولاً", "en": "The clipboard has no text, copy the link first"},
 }
 
 
@@ -156,6 +160,7 @@ HELP_TEXT = {
 الاختصار العام
 Insert+Control+Q: فتح نافذة الإضافة، تفتح دائماً على وضع العرض.
 Insert+Control+H: فتح نافذة المساعدة هذه.
+Insert+Shift+C: إضافة سريعة من أي برنامج آخر (متصفح، تليجرام، واتساب). انسخ الرابط أولاً بطريقتك المعتادة، ثم اضغط هذا الاختصار: يقرأ الرابط من الحافظة، ويطلب منك اختيار أو إنشاء المجموعة ثم الفئة، ثم يفتح نافذة إضافة برنامج بالرابط معبأً تلقائياً لتكتب الاسم والملاحظات.
 Control+D: التبديل بين وضع العرض ووضع التصميم داخل النافذة.
 
 وضع العرض (البحث والنسخ)
@@ -185,6 +190,7 @@ Control+O أو زر استيراد بيانات (آخر عنصر في ترتيب
 Global shortcut
 Insert+Control+Q: Open the add-on window, always opens in View mode.
 Insert+Control+H: Open this help window.
+Insert+Shift+C: Quick-add from any other program (browser, Telegram, WhatsApp). First copy the link as you normally would, then press this shortcut: it reads the link from the clipboard, asks you to choose or create the group then the category, then opens the add-software window with the link already filled in so you just type the name and notes.
 Control+D: Toggle between View mode and Design mode inside the window.
 
 View mode (search and copy)
@@ -674,10 +680,10 @@ class HelpDialog(wx.Dialog):
 class SearchDialog(wx.Dialog):
 	"""النافذة الرئيسية للإضافة: وضع العرض (بحث ونسخ) ووضع التصميم (إدارة بيانات)"""
 
-	def __init__(self, parent, data):
+	def __init__(self, parent, data, startMode="view"):
 		super().__init__(
 			parent,
-			title=tr("dialogTitleView"),
+			title=tr("dialogTitleDesign") if startMode == "design" else tr("dialogTitleView"),
 			style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER
 		)
 		self.data = data
@@ -685,11 +691,20 @@ class SearchDialog(wx.Dialog):
 		self.copiedItems = []
 		self._notesTimer = None
 		# الوضع الحالي: "view" وضع العرض، أو "design" وضع التصميم
-		self.mode = "view"
+		self.mode = startMode
 
 		self._buildUI()
 		self._bindEvents()
 		self._populateGroups()
+
+		if self.mode == "design":
+			# نُنشئ النافذة مباشرة في وضع التصميم (تُستخدم مع الإضافة
+			# السريعة من الحافظة)، بدون المرور بوضع العرض أولاً وبدون
+			# إعلان "وضع التصميم" الذي يوحي بدخول عام للتصفح
+			self.searchLabel.Hide()
+			self.searchCtrl.Hide()
+			self.copyButton.Hide()
+			self.importButton.Show()
 
 		self.SetSize((560, 420))
 		self.CentreOnScreen()
@@ -1230,6 +1245,67 @@ class SearchDialog(wx.Dialog):
 		dlg.Destroy()
 		return result
 
+	def _askName(self, title, label):
+		dlg = SimpleNameDialog(self, title, label)
+		result = None
+		if dlg.ShowModal() == wx.ID_OK:
+			result = dlg.GetValueEntered()
+		dlg.Destroy()
+		return result
+
+	def _pickOrCreate(self, dialogTitle, label, choices, createNewLabel, createTitle, createLabel):
+		result = self._pickFromList(dialogTitle, label, choices)
+		if result is None:
+			return None
+		if result == createNewLabel:
+			return self._askName(createTitle, createLabel)
+		return result
+
+	# ---------------------------------------------------------------
+	# إضافة سريعة من الحافظة (Insert+Shift+C من أي برنامج آخر): نفس
+	# نوافذ وضع التصميم المعتادة تماماً، بالرابط معبأً تلقائياً
+	# ---------------------------------------------------------------
+
+	def runQuickAdd(self, url, closeWhenDone=True):
+		createNewLabel = tr("createNewChoice")
+
+		groupChoices = [createNewLabel] + sorted(self.data.keys())
+		groupName = self._pickOrCreate(
+			tr("quickAddGroupTitle"), tr("groupLabel"), groupChoices,
+			createNewLabel, tr("addGroupTitle"), tr("groupNameLabel")
+		)
+		if groupName is None:
+			if closeWhenDone:
+				self.Close()
+			return
+
+		if groupName not in self.data:
+			# مجموعة جديدة كلياً: فئاتها فارغة أصلاً، فنتخطى القائمة
+			# مباشرة لمربع كتابة اسم الفئة الجديدة
+			categoryName = self._askName(tr("addCategoryTitle"), tr("categoryNameLabel"))
+		else:
+			categoryChoices = [createNewLabel] + sorted(self.data.get(groupName, {}).keys())
+			categoryName = self._pickOrCreate(
+				tr("quickAddCategoryTitle"), tr("categoryLabel"), categoryChoices,
+				createNewLabel, tr("addCategoryTitle"), tr("categoryNameLabel")
+			)
+		if categoryName is None:
+			if closeWhenDone:
+				self.Close()
+			return
+
+		dlg = SoftwareDialog(self, tr("addSoftwareTitle"), url=url)
+		if dlg.ShowModal() == wx.ID_OK:
+			name, finalUrl, url2, notes = dlg.GetValuesEntered()
+			softwareDict = self.data.setdefault(groupName, {}).setdefault(categoryName, {})
+			softwareDict[name] = {"url": finalUrl, "url2": url2, "notes": notes}
+			saveData(self.data)
+			ui.message(tr("msgAdded"))
+		dlg.Destroy()
+
+		if closeWhenDone:
+			self.Close()
+
 	def _moveFocusedItem(self):
 		focused = self.FindFocus()
 		if focused == self.groupList:
@@ -1535,6 +1611,31 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		if self._helpDialog is not None:
 			self._helpDialog.Destroy()
 			self._helpDialog = None
+
+	@script(
+		description="إضافة رابط سريع من الحافظة إلى إضافة قادرين",
+		gesture="kb:NVDA+shift+c"
+	)
+	def script_quickAddFromClipboard(self, gesture):
+		try:
+			clipboardText = api.getClipData().strip()
+		except Exception:
+			clipboardText = ""
+		if not clipboardText:
+			ui.message(tr("msgClipboardEmpty"))
+			return
+
+		wasAlreadyOpen = self._dialog is not None
+		if self._dialog is None:
+			self.data = loadData()
+			parentWindow = wx.GetApp().TopWindow if wx.GetApp() else None
+			self._dialog = SearchDialog(parentWindow, self.data, startMode="design")
+			self._dialog.Bind(wx.EVT_CLOSE, self._onDialogClose)
+			self._dialog.Show()
+		elif self._dialog.mode != "design":
+			self._dialog._toggleMode()
+
+		wx.CallAfter(self._dialog.runQuickAdd, clipboardText, not wasAlreadyOpen)
 
 	def terminate(self, *args, **kwargs):
 		super().terminate(*args, **kwargs)
