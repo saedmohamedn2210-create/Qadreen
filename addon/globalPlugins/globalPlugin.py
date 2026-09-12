@@ -5,13 +5,17 @@
 # وصفحة إعدادات لغة الإضافة داخل NVDA Settings.
 
 import os
+import base64
+import copy
 import json
 import time
 import tempfile
 import threading
 import webbrowser
 import urllib.parse
+import urllib.error
 import urllib.request
+import globalVars
 
 import wx
 import api
@@ -22,11 +26,30 @@ import languageHandler
 import addonHandler
 import globalPluginHandler
 from scriptHandler import script
+from logHandler import log
+
+try:
+	from . import crypto_manager
+except (ImportError, ValueError):
+	try:
+		import crypto_manager
+	except ImportError:
+		log.error("Qadreen: Failed to import crypto_manager. Tokens will not be encrypted.", exc_info=True)
+		class _FallbackCryptoManager:
+			@staticmethod
+			def encrypt_token(plain_text):
+				return plain_text
+			@staticmethod
+			def decrypt_token(cipher_text):
+				if cipher_text and cipher_text.startswith("dpapi:v1:"):
+					return ""
+				return cipher_text
+		crypto_manager = _FallbackCryptoManager()
 
 
-# مسار ملف البيانات: بجانب هذا الملف مباشرة داخل globalPlugins
+# مسار ملف بيانات Qadreen الدائم داخل إعدادات NVDA
 ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_FILE = os.path.join(ADDON_DIR, "data.json")
+DATA_FILE = os.path.join(globalVars.appArgs.configPath, "qadreen_data.json")
 
 
 # =====================================================================
@@ -35,7 +58,18 @@ DATA_FILE = os.path.join(ADDON_DIR, "data.json")
 # =====================================================================
 
 STRINGS = {
-	"scriptDescription": {"ar": "فتح نافذة البحث السريع عن روابط البرامج", "en": "Open the quick link search window"},
+	"scriptDescription": {
+		"ar": "فتح نافذة البحث السريع عن روابط البرامج",
+		"en": "Open the quick link search window"
+	},
+	"helpScriptDescription": {
+		"ar": "فتح نافذة مساعدة الإضافة",
+		"en": "Open the add-on help window"
+	},
+	"quickAddScriptDescription": {
+		"ar": "إضافة رابط سريع من الحافظة إلى إضافة قادرين",
+		"en": "Quickly add a link from the clipboard to Qadreen"
+	},
 	"dialogTitleView": {"ar": "قادرين - بحث سريع عن الروابط", "en": "Qadreen - Quick Link Search"},
 	"dialogTitleDesign": {"ar": "قادرين - وضع التصميم", "en": "Qadreen - Design Mode"},
 	"searchLabel": {"ar": "بحث:", "en": "Search:"},
@@ -60,6 +94,7 @@ STRINGS = {
 	"msgNameRequired": {"ar": "يجب إدخال اسم", "en": "A name is required"},
 	"msgSoftwareNameRequired": {"ar": "يجب إدخال اسم البرنامج", "en": "Software name is required"},
 	"msgUrlRequired": {"ar": "يجب إدخال الرابط", "en": "The link is required"},
+	"msgUrlExists": {"ar": "هذا الرابط موجود مسبقاً في قاعدة البيانات", "en": "This link already exists in the database"},
 	"msgNameExists": {"ar": "هذا الاسم موجود مسبقاً", "en": "This name already exists"},
 	"msgNameExistsInGroup": {"ar": "هذا الاسم موجود مسبقاً في هذه المجموعة", "en": "This name already exists in this group"},
 	"msgNameExistsInCategory": {"ar": "هذا الاسم موجود مسبقاً في هذه الفئة", "en": "This name already exists in this category"},
@@ -112,8 +147,8 @@ STRINGS = {
 		"en": 'Category "{}" will be moved from group "{}" to group "{}". If a category with the same name exists there, it will be merged. Continue?'
 	},
 	"confirmMoveSoftware": {
-		"ar": 'سيتم نقل البرنامج "{}" إلى: {} / {}. إن وُجد برنامج بنفس الاسم هناك سيتم استبدال بياناته. متابعة؟',
-		"en": 'Software "{}" will be moved to: {} / {}. If a software with the same name exists there, its data will be overwritten. Continue?'
+		"ar": 'سيتم نقل البرنامج "{}" إلى: {} / {}. إن وُجد برنامج بنفس الاسم سيتم ترقيمه تلقائياً. متابعة؟',
+		"en": 'Software "{}" will be moved to: {} / {}. If a software with the same name exists there, it will be numbered automatically. Continue?'
 	},
 	"contactDeveloperButton": {"ar": "تواصل مع المطور عبر البريد الإلكتروني", "en": "Contact the developer by email"},
 	"helpDialogTitle": {"ar": "مساعدة إضافة قادرين", "en": "Qadreen add-on help"},
@@ -139,16 +174,114 @@ STRINGS = {
 	"quickAddGroupTitle": {"ar": "اختر المجموعة", "en": "Choose group"},
 	"quickAddCategoryTitle": {"ar": "اختر الفئة", "en": "Choose category"},
 	"msgClipboardEmpty": {"ar": "لا يوجد نص في الحافظة، انسخ الرابط أولاً", "en": "The clipboard has no text, copy the link first"},
+	"settingsModeLabel": {"ar": "نمط عمل الإضافة", "en": "Add-on operation mode"},
+	"settingsOfflineMode": {"ar": "محلي (بدون إنترنت)", "en": "Offline (local only)"},
+	"settingsOnlineMode": {"ar": "تعاوني (مزامنة سحابية)", "en": "Online (cloud sync)"},
+	"settingsGistIdLabel": {"ar": "معرف Gist", "en": "Gist ID"},
+	"settingsPatLabel": {"ar": "مفتاح الوصول الشخصي (PAT)", "en": "Personal Access Token (PAT)"},
+	"settingsPatWarning": {
+		"ar": "تنبيه: يُخزَّن هذا المفتاح كنص عادي غير مشفّر في إعدادات NVDA. استخدم مفتاحاً بصلاحية gist فقط، ولا تستخدم مفتاحاً له أي صلاحيات إضافية على حسابك.",
+		"en": "Warning: this token is stored as plain, unencrypted text in NVDA's settings. Use a token scoped to gist access only, never one with broader account permissions."
+	},
+	"settingsSourceTypeLabel": {"ar": "مصدر المزامنة", "en": "Sync source"},
+	"settingsSourceGist": {"ar": "Gist", "en": "Gist"},
+	"settingsSourceRepo": {"ar": "مستودع (Repository)", "en": "Repository"},
+	"settingsRepoOwnerNameLabel": {"ar": "المستودع (المالك/الاسم)", "en": "Repository (owner/name)"},
+	"settingsRepoPathLabel": {"ar": "مسار الملف داخل المستودع", "en": "File path inside the repository"},
+	"settingsRepoBranchLabel": {"ar": "الفرع (Branch)", "en": "Branch"},
+	"settingsRepoPatLabel": {"ar": "مفتاح الوصول الشخصي (PAT) للمستودع", "en": "Personal Access Token (PAT) for the repository"},
+	"settingsRepoPatWarning": {
+		"ar": "لهذا المفتاح صلاحيات أوسع من مفتاح Gist. للمستودعات العامة استخدم صلاحية public_repo فقط. للمستودعات الخاصة، يُفضَّل توكن Fine-grained محدد بمستودع واحد وصلاحية Contents: Read and write فقط، بدلاً من صلاحية repo الكلاسيكية الكاملة.",
+		"en": "This token needs broader permissions than the Gist token. For public repositories, use the public_repo scope only. For private repositories, prefer a fine-grained token limited to this one repository with Contents: Read and write access, instead of the full classic repo scope."
+	},
+	"msgOnlineModeRequired": {"ar": "هذا الاختصار يعمل فقط في الوضع التعاوني (Online)", "en": "This shortcut only works in Online mode"},
+	"msgSelectGroupOrCategoryFirst": {"ar": "قف على مجموعة أو فئة أولاً", "en": "Stand on a group or category first"},
+	"msgSharingEnabled": {"ar": "تم تفعيل المشاركة", "en": "Sharing enabled"},
+	"msgSharingDisabled": {"ar": "تم إيقاف المشاركة", "en": "Sharing disabled"},
+	"onlineDesignModeScriptDescription": {
+		"ar": "تبديل وضع التصميم السحابي (للمالك فقط)",
+		"en": "Toggle Online Design Mode (Owner only)"
+	},
+	"msgOnlineDesignOffline": {
+		"ar": "وضع التصميم السحابي غير متاح في الوضع المحلي (Offline)",
+		"en": "Online Design Mode is not available in Offline mode"
+	},
+	"msgGitHubCredentialsMissing": {
+		"ar": "بيانات GitHub ناقصة، تأكد من اسم مالك المستودع ورمز PAT في الإعدادات",
+		"en": "GitHub credentials missing, check repo owner and PAT in settings"
+	},
+	"msgVerifyingUser": {
+		"ar": "جاري التحقق من هوية مستخدم GitHub...",
+		"en": "Verifying GitHub user identity..."
+	},
+	"msgAuthInProgress": {
+		"ar": "عملية التحقق جارية بالفعل، يرجى الانتظار",
+		"en": "Authentication is already in progress, please wait"
+	},
+	"msgOwnerOnly": {
+		"ar": "وضع التصميم السحابي مخصص لمالك المستودع فقط",
+		"en": "Online Design Mode is restricted to the repository owner only"
+	},
+	"msgOnlineDesignModeEnabled": {
+		"ar": "تم التحقق من ملكية المستودع. تم تفعيل وضع التصميم السحابي بنجاح.",
+		"en": "Online Design Mode enabled"
+	},
+	"msgOnlineDesignModeDisabled": {
+		"ar": "تم إيقاف وضع التصميم السحابي",
+		"en": "Online Design Mode disabled"
+	},
+	"msgAuthFailed": {
+		"ar": "تعذر التحقق من هوية GitHub، تأكد من اتصال الإنترنت وصلاحية PAT",
+		"en": "Could not verify GitHub identity, check connection and PAT validity"
+	},
+	"deletedItemsScriptDescription": {
+		"ar": "فتح قائمة العناصر المحذوفة (Blacklist)",
+		"en": "Open deleted items list (Blacklist)"
+	},
+	"deletedItemsDialogTitle": {
+		"ar": "قادرين - العناصر المحذوفة",
+		"en": "Qadreen - Deleted Items"
+	},
+	"deletedItemsListLabel": {
+		"ar": "قائمة البرامج المحذوفة:",
+		"en": "Deleted software list:"
+	},
+	"removeBlacklistButton": {
+		"ar": "إزالة من القائمة (Delete)",
+		"en": "Remove from blacklist (Delete)"
+	},
+	"labelLocal": {
+		"ar": "محلي",
+		"en": "Local"
+	},
+	"labelCloud": {
+		"ar": "سحابي",
+		"en": "Cloud"
+	},
+	"msgNoDeletedItems": {
+		"ar": "لا توجد عناصر محذوفة",
+		"en": "No deleted items"
+	},
+	"msgItemRemovedFromBlacklist": {
+		"ar": "تمت إزالة العنصر من قائمة المحذوفات",
+		"en": "Item removed from blacklist"
+	},
 }
 
 
 def getLanguage():
-	"""تحديد لغة واجهة الإضافة الحالية بناءً على إعداد المستخدم"""
-	setting = config.conf["qadreen"]["language"]
+	"""تحديد لغة واجهة الإضافة الحالية مع تأمين ضد أخطاء التهيئة المبكرة"""
+	try:
+		setting = config.conf["qadreen"]["language"]
+	except KeyError:
+		setting = "follow"
+
 	if setting == "ar":
 		return "ar"
+
 	if setting == "en":
 		return "en"
+
 	# follow: اتباع لغة NVDA الحالية
 	nvdaLang = languageHandler.getLanguage()
 	return "ar" if nvdaLang.startswith("ar") else "en"
@@ -161,6 +294,8 @@ HELP_TEXT = {
 Insert+Control+Q: فتح نافذة الإضافة، تفتح دائماً على وضع العرض.
 Insert+Control+H: فتح نافذة المساعدة هذه.
 Insert+Shift+C: إضافة سريعة من أي برنامج آخر (متصفح، تليجرام، واتساب). انسخ الرابط أولاً بطريقتك المعتادة، ثم اضغط هذا الاختصار: يقرأ الرابط من الحافظة، ويطلب منك اختيار أو إنشاء المجموعة ثم الفئة، ثم يفتح نافذة إضافة برنامج بالرابط معبأً تلقائياً لتكتب الاسم والملاحظات.
+Control+-: فتح قائمة العناصر المحذوفة (Blacklist) لإدارتها أو استعادتها.
+Control+Shift+D: التبديل بين وضع التصميم المحلي ووضع التصميم السحابي المركزي (Online Design Mode) لمالك المستودع.
 Control+D: التبديل بين وضع العرض ووضع التصميم داخل النافذة.
 
 وضع العرض (البحث والنسخ)
@@ -181,6 +316,8 @@ Control+F2: إضافة برنامج للفئة المحددة حالياً (ال
 F2: تعديل العنصر الذي عليه التركيز حالياً (مجموعة أو فئة أو برنامج)، بكل بياناته.
 Delete: حذف العنصر الذي عليه التركيز حالياً، مع رسالة تأكيد.
 Control+M: نقل أو دمج العنصر الذي عليه التركيز حالياً (مجموعة أو فئة أو برنامج) إلى مكان آخر، مع رسالة تأكيد قبل التنفيذ.
+Control+Shift+O: تفعيل المشاركة السحابية للمجموعة أو الفئة المحددة حالياً.
+Control+Shift+F: إيقاف المشاركة السحابية للمجموعة أو الفئة المحددة حالياً.
 Control+O أو زر استيراد بيانات (آخر عنصر في ترتيب Tab): استيراد بيانات من ملف data.json آخر ودمجها مع بياناتك الحالية دون حذف أي شيء. العنصر المطابق تماماً (نفس المسار ونفس الرابط) يُتجاهل، والعنصر بنفس المسار لكن برابط مختلف يُضاف كنسخة منفصلة بجانب القديم.
 
 إعدادات الإضافة
@@ -191,6 +328,8 @@ Global shortcut
 Insert+Control+Q: Open the add-on window, always opens in View mode.
 Insert+Control+H: Open this help window.
 Insert+Shift+C: Quick-add from any other program (browser, Telegram, WhatsApp). First copy the link as you normally would, then press this shortcut: it reads the link from the clipboard, asks you to choose or create the group then the category, then opens the add-software window with the link already filled in so you just type the name and notes.
+Control+-: Open the deleted items list (Blacklist) to manage or restore them.
+Control+Shift+D: Toggle between local Design mode and Central Online Design Mode for the repository owner.
 Control+D: Toggle between View mode and Design mode inside the window.
 
 View mode (search and copy)
@@ -211,6 +350,8 @@ Control+F2: add a software item to the currently selected category (name, then a
 F2: edit the currently focused item (group, category, or software), including all its data.
 Delete: delete the currently focused item, with a confirmation prompt.
 Control+M: move or merge the currently focused item (group, category, or software) to another location, with a confirmation prompt before it happens.
+Control+Shift+O: enable cloud sharing for the currently focused group or category.
+Control+Shift+F: disable cloud sharing for the currently focused group or category.
 Control+O or the Import data button (last item in Tab order): import data from another data.json file and merge it with your current data without deleting anything. An item that matches exactly (same path and same link) is skipped, and an item with the same path but a different link is added as a separate copy next to the old one.
 
 Add-on settings
@@ -251,29 +392,148 @@ def formatResultsCount(count):
 
 confspec = {
 	"language": 'option("follow","ar","en", default="follow")',
+	"onlineMode": "boolean(default=false)",   # Default is offline
+	"gistId": 'string(default="")',
+	"pat": 'string(default="")',              # Stored as plain text
+	# Repository source settings. Gist settings above remain supported.
+	"sourceType": 'option("gist","repo", default="gist")',
+	"repoOwnerName": 'string(default="")',
+	"repoPath": 'string(default="qadreen_data.json")',
+	"repoBranch": 'string(default="main")',
+	"repoPat": 'string(default="")',
 }
 config.conf.spec["qadreen"] = confspec
 
 
+# قفل واحد مشترك يحمي أي قراءة أو كتابة لملف البيانات لضمان Thread-Safety
+dataFileLock = threading.Lock()
+
+
 def loadData():
-	"""تحميل ملف data.json إلى قاموس في الذاكرة"""
-	if os.path.isfile(DATA_FILE):
-		try:
-			with open(DATA_FILE, "r", encoding="utf-8") as f:
-				return json.load(f)
-		except (OSError, json.JSONDecodeError):
-			return {}
-	return {}
+	"""تحميل بيانات Qadreen."""
+	with dataFileLock:
+		if os.path.isfile(DATA_FILE):
+			try:
+				with open(DATA_FILE, "r", encoding="utf-8") as f:
+					return json.load(f)
+			except (OSError, json.JSONDecodeError):
+				return {}
+		return {}
 
 
 def saveData(data):
-	"""حفظ القاموس الحالي إلى ملف data.json"""
-	try:
-		with open(DATA_FILE, "w", encoding="utf-8") as f:
-			json.dump(data, f, ensure_ascii=False, indent="\t")
+	"""حفظ بيانات Qadreen."""
+	with dataFileLock:
+		try:
+			with open(DATA_FILE, "w", encoding="utf-8") as f:
+				json.dump(data, f, ensure_ascii=False, indent="\t")
+			return True
+		except OSError:
+			return False
+
+
+METADATA_KEY = "__metadata__"
+
+
+def getGroupNames(data):
+	"""أسماء المجموعات الحقيقية فقط، مع استثناء مفتاح البيانات الوصفية المحجوز"""
+	return sorted(name for name in data.keys() if name != METADATA_KEY)
+
+
+def getSharedItems(data):
+	return data.get(METADATA_KEY, {}).get("shared_items", [])
+
+
+def isPathShared(data, groupName, categoryName=None):
+	sharedItems = getSharedItems(data)
+	if [groupName] in sharedItems:
 		return True
-	except OSError:
-		return False
+	if categoryName is not None and [groupName, categoryName] in sharedItems:
+		return True
+	return False
+
+
+def addSharedPath(data, path):
+	metadata = data.setdefault(METADATA_KEY, {})
+	sharedItems = metadata.setdefault("shared_items", [])
+	if path not in sharedItems:
+		sharedItems.append(path)
+
+
+def removeSharedPath(data, path):
+	sharedItems = getSharedItems(data)
+	if path in sharedItems:
+		sharedItems.remove(path)
+
+
+def getLocalIgnored(data):
+	"""الحصول على قائمة السجلات المحذوفة محلياً من __metadata__."""
+	metadata = data.setdefault(METADATA_KEY, {})
+	return metadata.setdefault("local_ignored_urls", [])
+
+
+def getCloudDeleted(data):
+	"""الحصول على قائمة السجلات المحذوفة مركزياً (Tombstones) من __metadata__."""
+	metadata = data.setdefault(METADATA_KEY, {})
+	return metadata.setdefault("cloud_deleted_urls", [])
+
+
+def addLocalIgnored(data, url, name, group="", category=""):
+	"""إضافة برنامج إلى قائمة الحذف المحلي ومنع التكرار بناءً على url."""
+	cleanUrl = url.strip()
+	if not cleanUrl:
+		return
+	items = getLocalIgnored(data)
+	for item in items:
+		if item.get("url") == cleanUrl:
+			item["name"] = name
+			item["group"] = group
+			item["category"] = category
+			return
+	items.append({
+		"url": cleanUrl,
+		"name": name,
+		"group": group,
+		"category": category
+	})
+
+
+def addCloudDeleted(data, url, name, group="", category=""):
+	"""إضافة برنامج إلى قائمة الحذف المركزي السحابي ومنع التكرار بناءً على url."""
+	cleanUrl = url.strip()
+	if not cleanUrl:
+		return
+	items = getCloudDeleted(data)
+	for item in items:
+		if item.get("url") == cleanUrl:
+			item["name"] = name
+			item["group"] = group
+			item["category"] = category
+			return
+	items.append({
+		"url": cleanUrl,
+		"name": name,
+		"group": group,
+		"category": category
+	})
+
+
+def removeLocalIgnored(data, url):
+	"""إزالة برنامج من قائمة الحذف المحلي بناءً على url."""
+	cleanUrl = url.strip()
+	if not cleanUrl:
+		return
+	items = getLocalIgnored(data)
+	items[:] = [item for item in items if item.get("url") != cleanUrl]
+
+
+def removeCloudDeleted(data, url):
+	"""إزالة برنامج من قائمة الحذف السحابي بناءً على url."""
+	cleanUrl = url.strip()
+	if not cleanUrl:
+		return
+	items = getCloudDeleted(data)
+	items[:] = [item for item in items if item.get("url") != cleanUrl]
 
 
 # =====================================================================
@@ -284,12 +544,6 @@ def saveData(data):
 
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/saedmohamedn2210-create/Qadreen/releases/latest"
 
-# مكان النسخة الاحتياطية لبيانات المستخدم أثناء التحديث: خارج مجلد
-# الإضافة تماماً (في مجلد المستخدم)، حتى تنجو من استبدال مجلد الإضافة
-# بالكامل أثناء التثبيت، وتُستعاد تلقائياً عند أول تشغيل بعد إعادة التشغيل
-UPDATE_BACKUP_PATH = os.path.join(os.path.expanduser("~"), ".qadreen_data_backup.json")
-
-
 def parseVersion(versionString):
 	"""تحويل نص إصدار مثل '1.2' أو 'v1.2' إلى tuple أرقام لمقارنة صحيحة"""
 	parts = []
@@ -297,23 +551,6 @@ def parseVersion(versionString):
 		digits = "".join(ch for ch in part if ch.isdigit())
 		parts.append(int(digits) if digits else 0)
 	return tuple(parts)
-
-
-def restoreDataBackupIfNeeded():
-	"""تُستدعى عند بدء تشغيل الإضافة: لو وُجدت نسخة احتياطية من data.json
-	تركها تحديث سابق (لأن حزمة التثبيت الجديدة استبدلت data.json بنسختها
-	التجريبية الافتراضية)، تُستعاد بيانات المستخدم الحقيقية فوراً، ثم تُحذف
-	النسخة الاحتياطية حتى لا تُعاد مرة أخرى في المرات القادمة."""
-	if not os.path.isfile(UPDATE_BACKUP_PATH):
-		return
-	try:
-		with open(UPDATE_BACKUP_PATH, "r", encoding="utf-8") as f:
-			backupData = json.load(f)
-		with open(DATA_FILE, "w", encoding="utf-8") as f:
-			json.dump(backupData, f, ensure_ascii=False, indent="\t")
-		os.remove(UPDATE_BACKUP_PATH)
-	except (OSError, json.JSONDecodeError):
-		pass
 
 
 def promptRestart():
@@ -361,25 +598,33 @@ def downloadAndInstallUpdate(releaseData):
 		wx.CallAfter(ui.message, tr("msgUpdateDownloadFailed"))
 		return
 
-	# نسخ بيانات المستخدم الحالية لمكان آمن خارج مجلد الإضافة قبل التثبيت،
-	# لأن التثبيت سيستبدل مجلد الإضافة بالكامل بما فيه data.json التجريبي
-	try:
-		if os.path.isfile(DATA_FILE):
-			with open(DATA_FILE, "r", encoding="utf-8") as src:
-				currentDataText = src.read()
-			with open(UPDATE_BACKUP_PATH, "w", encoding="utf-8") as dst:
-				dst.write(currentDataText)
-	except OSError:
-		pass
+	# التثبيت الفعلي يجب أن يتم على الخيط الرئيسي لـNVDA وليس هذا الخيط
+	# الخلفي، وإلا قد يفشل تثبيت الإضافة بصمت أو يفسد حالة التثبيت المعلّق
+	wx.CallAfter(installUpdateOnMainThread, tempPath)
 
+
+def installUpdateOnMainThread(tempPath):
+	"""تُنفَّذ على الخيط الرئيسي حصراً عبر wx.CallAfter"""
 	try:
+		# 1. فتح حزمة التحديث المُنزلة والتحقق من ملفاتها
 		bundle = addonHandler.AddonBundle(tempPath)
+		# 2. استخراج الحزمة إلى مجلد Qadreen.pendingInstall (لا يتعارض
+		#    مع مجلد Qadreen النشط، لأن الاسم مختلف تماماً)
 		addonHandler.installAddonBundle(bundle)
-	except Exception:
-		wx.CallAfter(ui.message, tr("msgUpdateInstallFailed"))
+		# 3. وصلنا هنا فقط لو نجح الاستخراج بالكامل. الآن، وليس قبل
+		#    ذلك، نُعلِّم النسخة القديمة النشطة للحذف عند الإقلاع القادم،
+		#    حتى يجد NVDA المسار فارغاً وينقل pendingInstall مكانه بسلاسة
+		curAddon = addonHandler.getCodeAddon()
+		if curAddon and not getattr(curAddon, "isPendingRemove", False):
+			curAddon.requestRemove()
+	except Exception as e:
+		# لو فشلت الخطوة 1 أو 2: لن نصل أبداً لسطر requestRemove، فتبقى
+		# النسخة القديمة سليمة وتعمل كما هي دون أي أثر
+		log.error("Failed to install Qadreen update bundle: {}".format(e), exc_info=True)
+		ui.message(tr("msgUpdateInstallFailed"))
 		return
-
-	wx.CallAfter(promptRestart)
+	# 4. نجح كل شيء: نطلب إعادة التشغيل
+	promptRestart()
 
 
 def onUpdateFound(releaseData, latestTag):
@@ -431,49 +676,108 @@ def checkForUpdateInBackground():
 
 def mergeData(target, source):
 	"""
-	دمج بيانات مستوردة (source) داخل البيانات الحالية (target) دون حذف أو
-	استبدال أي شيء موجود فعلاً. الهوية الكاملة (مجموعة + فئة + برنامج) هي
-	التي تحدد إن كان العنصر موجوداً.
-	العناصر الموجودة فقط في target تبقى كما هي.
-	العناصر الموجودة فقط في source تُضاف كما هي.
-	العناصر المشتركة (بنفس المسار الكامل):
-	  - لو الرابط (الأساسي والإضافي) متطابق تماماً مع الموجود عندك: يُتجاهل
-	    العنصر بالكامل، لا تغيير إطلاقاً.
-	  - لو الرابط مختلف: لا يُستبدل القديم، بل يُضاف العنصر المستورد كنسخة
-	    منفصلة بجانبه (باسم مميز، لأن نفس الاسم لا يمكن أن يتكرر حرفياً
-	    داخل نفس الفئة)، فتحتفظ بالنسختين معاً لتقارن بينهما بنفسك لاحقاً.
-	إرجاع: (عدد العناصر المضافة الجديدة كلياً، عدد النسخ الإضافية المُضافة
-	بسبب اختلاف الرابط عند نفس المسار).
+	دمج البيانات المستوردة داخل البيانات الحالية دون حذف أو استبدال.
+	الرابط الأساسي url هو المعيار الحاسم والوحيد لتحديد التعارض:
+	- يُرفض أي برنامج يطابق رابطه الأساسي أي رابط أساسي موجود مسبقاً.
+	- لا تُنشأ مجموعة أو فئة جديدة إذا تم رفض العنصر بسبب تطابق الرابط.
+	- إذا اختلف الرابط الأساسي وتكرر الاسم، يُضاف كنسخة مستقلة: Name (2), Name (3)...
 	"""
 	addedCount = 0
 	duplicatedCount = 0
+
+	# جمع كافة الروابط الأساسية الموجودة حالياً في البيانات
+	existingUrls = set()
+	for groupData in target.values():
+		if not isinstance(groupData, dict):
+			continue
+		for categoryData in groupData.values():
+			if not isinstance(categoryData, dict):
+				continue
+			for info in categoryData.values():
+				if not isinstance(info, dict):
+					continue
+				url = info.get("url", "")
+				if url:
+					existingUrls.add(url)
+
 	for groupName, categories in source.items():
-		targetGroup = target.setdefault(groupName, {})
+		if not isinstance(categories, dict):
+			continue
 		for categoryName, softwareDict in categories.items():
-			targetCategory = targetGroup.setdefault(categoryName, {})
+			if not isinstance(softwareDict, dict):
+				continue
 			for softwareName, info in softwareDict.items():
+				if not isinstance(info, dict):
+					continue
+
+				importedUrl = info.get("url", "")
+				if not importedUrl or importedUrl in existingUrls:
+					continue
+
+				# لا ننشئ المجموعة والفئة إلا بعد التأكد التام من قبول العنصر
+				targetGroup = target.setdefault(groupName, {})
+				targetCategory = targetGroup.setdefault(categoryName, {})
+
 				if softwareName not in targetCategory:
 					targetCategory[softwareName] = info
 					addedCount += 1
-					continue
-
-				existing = targetCategory[softwareName]
-				sameUrl = existing.get("url", "") == info.get("url", "")
-				sameUrl2 = existing.get("url2", "") == info.get("url2", "")
-				if sameUrl and sameUrl2:
-					# نفس المسار ونفس الرابط تماماً: تجاهل كامل
-					continue
-
-				# نفس المسار لكن الرابط مختلف: لا نستبدل، بل نضيف نسخة
-				# منفصلة باسم مميز بجانب النسخة الأصلية
-				newName = softwareName
-				counter = 2
-				while newName in targetCategory:
+				else:
+					counter = 2
 					newName = "{} ({})".format(softwareName, counter)
-					counter += 1
-				targetCategory[newName] = info
-				duplicatedCount += 1
+					while newName in targetCategory:
+						counter += 1
+						newName = "{} ({})".format(softwareName, counter)
+					targetCategory[newName] = info
+					duplicatedCount += 1
+
+				existingUrls.add(importedUrl)
+
 	return addedCount, duplicatedCount
+
+
+def isUrlExists(data, targetUrl, exclude=None):
+	"""
+	فحص ما إذا كان الرابط الأساسي targetUrl موجوداً في أي مكان داخل البيانات.
+	exclude: tuple اختياري بصيغة (groupName, categoryName, softwareName)
+	لاستثنائه أثناء التعديل أو النقل حتى لا يعتبر العنصر نفسه تعارضاً.
+	"""
+	if not targetUrl:
+		return False
+	targetUrlClean = targetUrl.strip()
+	if not targetUrlClean:
+		return False
+
+	for groupName, categories in data.items():
+		if groupName == METADATA_KEY or not isinstance(categories, dict):
+			continue
+		for categoryName, softwareDict in categories.items():
+			if not isinstance(softwareDict, dict):
+				continue
+			for softwareName, info in softwareDict.items():
+				if not isinstance(info, dict):
+					continue
+				if exclude and (groupName, categoryName, softwareName) == exclude:
+					continue
+				existingUrl = info.get("url", "").strip()
+				if existingUrl and existingUrl == targetUrlClean:
+					return True
+	return False
+
+
+def getUniqueSoftwareName(categoryDict, baseName):
+	"""
+	توليد اسم فريد للبرنامج داخل الفئة المحددة لتجنب استبدال البرامج ذات الروابط المختلفة.
+	إذا كان الاسم غير موجود يُعاد كما هو.
+	إذا كان موجوداً، يُضاف ترقيم تسلسلي: Name (2), Name (3)...
+	"""
+	if baseName not in categoryDict:
+		return baseName
+	counter = 2
+	newName = "{} ({})".format(baseName, counter)
+	while newName in categoryDict:
+		counter += 1
+		newName = "{} ({})".format(baseName, counter)
+	return newName
 
 
 def confirmYesNo(parent, title, message):
@@ -647,7 +951,9 @@ class HelpDialog(wx.Dialog):
 			style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER
 		)
 
-		sizer = wx.BoxSizer(wx.VERTICAL)
+		mainSizer = wx.BoxSizer(wx.VERTICAL)
+		contentSizer = wx.BoxSizer(wx.VERTICAL)
+		sizerHelper = gui.guiHelper.BoxSizerHelper(self, sizer=contentSizer)
 
 		text = HELP_TEXT.get(getLanguage(), HELP_TEXT["en"])
 		self.textCtrl = wx.TextCtrl(
@@ -656,37 +962,139 @@ class HelpDialog(wx.Dialog):
 		)
 		self.textCtrl.SetName(tr("helpDialogTitle"))
 
-		closeButton = wx.Button(self, id=wx.ID_CLOSE, label=tr("helpCloseButton"))
+		sizerHelper.addItem(self.textCtrl, proportion=1, flag=wx.EXPAND)
 
-		sizer.Add(self.textCtrl, 1, wx.EXPAND | wx.ALL, 8)
-		sizer.Add(closeButton, 0, wx.ALIGN_CENTER | wx.BOTTOM, 8)
+		buttonSizer = gui.guiHelper.ButtonHelper(wx.HORIZONTAL)
+		button = buttonSizer.addButton(self, label=tr("helpCloseButton"), id=wx.ID_CLOSE)
+		button.Bind(wx.EVT_BUTTON, lambda evt: self.Close())
+		sizerHelper.addDialogDismissButtons(buttonSizer)
 
-		self.SetSizer(sizer)
+		mainSizer.Add(
+			contentSizer,
+			border=gui.guiHelper.BORDER_FOR_DIALOGS,
+			flag=wx.ALL | wx.EXPAND,
+			proportion=1
+		)
+		self.SetSizer(mainSizer)
+
+		self.SetAffirmativeId(wx.ID_CLOSE)
+		self.SetEscapeId(wx.ID_CLOSE)
+
 		self.SetSize((640, 520))
 		self.CentreOnScreen()
 
-		closeButton.Bind(wx.EVT_BUTTON, lambda evt: self.Close())
-		self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
-
 		wx.CallAfter(self.textCtrl.SetFocus)
 
-	def onCharHook(self, event):
-		if event.GetKeyCode() == wx.WXK_ESCAPE:
-			self.Close()
+
+class DeletedItemsDialog(wx.Dialog):
+	"""نافذة إدارة العناصر المحذوفة (Blacklist) الخاصة بإضافة قادرين"""
+
+	def __init__(self, parent, data, plugin):
+		super().__init__(
+			parent,
+			title=tr("deletedItemsDialogTitle"),
+			style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER
+		)
+		self.data = data
+		self.plugin = plugin
+		self.itemsList = []
+
+		sizer = wx.BoxSizer(wx.VERTICAL)
+		lbl = wx.StaticText(self, label=tr("deletedItemsListLabel"))
+		self.listBox = wx.ListBox(self, style=wx.LB_SINGLE)
+		self.listBox.SetName(tr("deletedItemsListLabel"))
+
+		buttonsSizer = wx.BoxSizer(wx.HORIZONTAL)
+		self.removeButton = wx.Button(self, label=tr("removeBlacklistButton"))
+		self.closeButton = wx.Button(self, id=wx.ID_CLOSE, label=tr("closeButton"))
+		buttonsSizer.Add(self.removeButton, 0, wx.RIGHT, 8)
+		buttonsSizer.Add(self.closeButton, 0)
+
+		sizer.Add(lbl, 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+		sizer.Add(self.listBox, 1, wx.EXPAND | wx.ALL, 8)
+		sizer.Add(buttonsSizer, 0, wx.ALIGN_CENTER | wx.ALL, 8)
+
+		self.SetSizer(sizer)
+		self.SetSize((480, 360))
+		self.CentreOnScreen()
+
+		self._populateItems()
+
+		self.removeButton.Bind(wx.EVT_BUTTON, self.onRemoveFromBlacklist)
+		self.closeButton.Bind(wx.EVT_BUTTON, lambda evt: self.Close())
+		self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
+
+		wx.CallAfter(self.listBox.SetFocus)
+
+	def _populateItems(self):
+		self.listBox.Clear()
+		self.itemsList = []
+
+		localIgnored = getLocalIgnored(self.data)
+		cloudDeleted = getCloudDeleted(self.data)
+
+		# عناصر الحذف المحلي تظهر لجميع المستخدمين
+		for item in localIgnored:
+			displayStr = "{} — {}".format(item.get("name", ""), tr("labelLocal"))
+			self.itemsList.append(("local", item.get("url", ""), item))
+			self.listBox.Append(displayStr)
+
+		# عناصر الحذف السحابي تظهر حصراً للمالك
+		if getattr(self.plugin, "isRepoOwner", False):
+			for item in cloudDeleted:
+				displayStr = "{} — {}".format(item.get("name", ""), tr("labelCloud"))
+				self.itemsList.append(("cloud", item.get("url", ""), item))
+				self.listBox.Append(displayStr)
+
+		if self.itemsList:
+			self.listBox.SetSelection(0)
 		else:
-			event.Skip()
+			ui.message(tr("msgNoDeletedItems"))
+
+	def onRemoveFromBlacklist(self, event=None):
+		sel = self.listBox.GetSelection()
+		if sel == wx.NOT_FOUND or sel >= len(self.itemsList):
+			ui.message(tr("msgSelectItemFirst"))
+			return
+
+		itemType, url, record = self.itemsList[sel]
+		if itemType == "local":
+			removeLocalIgnored(self.data, url)
+		elif itemType == "cloud":
+			removeCloudDeleted(self.data, url)
+
+		saveData(self.data)
+		ui.message(tr("msgItemRemovedFromBlacklist"))
+
+		self._populateItems()
+		newCount = len(self.itemsList)
+		if newCount > 0:
+			newSel = min(sel, newCount - 1)
+			self.listBox.SetSelection(newSel)
+			self.listBox.SetFocus()
+
+	def onCharHook(self, event):
+		keyCode = event.GetKeyCode()
+		if keyCode == wx.WXK_ESCAPE:
+			self.Close()
+			return
+		if keyCode == wx.WXK_DELETE:
+			self.onRemoveFromBlacklist()
+			return
+		event.Skip()
 
 
 class SearchDialog(wx.Dialog):
 	"""النافذة الرئيسية للإضافة: وضع العرض (بحث ونسخ) ووضع التصميم (إدارة بيانات)"""
 
-	def __init__(self, parent, data, startMode="view"):
+	def __init__(self, parent, data, startMode="view", plugin=None):
 		super().__init__(
 			parent,
 			title=tr("dialogTitleDesign") if startMode == "design" else tr("dialogTitleView"),
 			style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER
 		)
 		self.data = data
+		self.plugin = plugin
 		# قائمة الروابط المجمعة للنسخ المتعدد: كل عنصر (اسم البرنامج، الرابط)
 		self.copiedItems = []
 		self._notesTimer = None
@@ -780,7 +1188,7 @@ class SearchDialog(wx.Dialog):
 
 	def _populateGroups(self):
 		self.groupList.Clear()
-		for groupName in sorted(self.data.keys()):
+		for groupName in getGroupNames(self.data):
 			self.groupList.Append(groupName)
 		self.categoryList.Clear()
 		self.softwareList.Clear()
@@ -811,7 +1219,7 @@ class SearchDialog(wx.Dialog):
 		categoryEntries = []  # (categoryLabel, key)
 		softwareEntries = []  # (softwareLabel, clientData)
 
-		for groupName in sorted(self.data.keys()):
+		for groupName in getGroupNames(self.data):
 			categories = self.data[groupName]
 			for categoryName in sorted(categories.keys()):
 				softwareDict = categories[categoryName]
@@ -937,6 +1345,12 @@ class SearchDialog(wx.Dialog):
 				return
 
 		if self.mode == "design":
+			if event.ControlDown() and event.ShiftDown() and keyCode == ord("O"):
+				self._toggleSharing(share=True)
+				return
+			if event.ControlDown() and event.ShiftDown() and keyCode == ord("F"):
+				self._toggleSharing(share=False)
+				return
 			if event.ControlDown() and event.ShiftDown() and keyCode == ord("N"):
 				self._addCategory()
 				return
@@ -1051,15 +1465,18 @@ class SearchDialog(wx.Dialog):
 		dlg = SoftwareDialog(self, tr("addSoftwareTitle"))
 		if dlg.ShowModal() == wx.ID_OK:
 			name, url, url2, notes = dlg.GetValuesEntered()
+			if isUrlExists(self.data, url):
+				ui.message(tr("msgUrlExists"))
+				dlg.Destroy()
+				return
 			softwareDict = self.data.setdefault(groupName, {}).setdefault(categoryName, {})
-			if name in softwareDict:
-				ui.message(tr("msgNameExistsInCategory"))
-			else:
-				softwareDict[name] = {"url": url, "url2": url2, "notes": notes}
-				saveData(self.data)
-				self._populateSoftwareForCategory(groupName, categoryName)
-				self._selectAndFocus(self.softwareList, name)
-				ui.message(tr("msgAdded"))
+			finalName = getUniqueSoftwareName(softwareDict, name)
+			softwareDict[finalName] = {"url": url, "url2": url2, "notes": notes}
+			removeLocalIgnored(self.data, url)
+			saveData(self.data)
+			self._populateSoftwareForCategory(groupName, categoryName)
+			self._selectAndFocus(self.softwareList, finalName)
+			ui.message(tr("msgAdded"))
 		dlg.Destroy()
 
 	# ---------------------------------------------------------------
@@ -1147,24 +1564,30 @@ class SearchDialog(wx.Dialog):
 		)
 		if dlg.ShowModal() == wx.ID_OK:
 			newName, url, url2, notes = dlg.GetValuesEntered()
+			if isUrlExists(self.data, url, exclude=(groupName, categoryName, oldName)):
+				ui.message(tr("msgUrlExists"))
+				dlg.Destroy()
+				return
+
 			softwareDict = self.data[groupName][categoryName]
-			if newName != oldName and newName in softwareDict:
-				ui.message(tr("msgNameExistsInCategory"))
+			if newName != oldName:
+				finalName = getUniqueSoftwareName(softwareDict, newName)
+				reordered = {}
+				for key, value in softwareDict.items():
+					if key == oldName:
+						reordered[finalName] = {"url": url, "url2": url2, "notes": notes}
+					else:
+						reordered[key] = value
+				self.data[groupName][categoryName] = reordered
 			else:
-				if newName != oldName:
-					reordered = {}
-					for key, value in softwareDict.items():
-						if key == oldName:
-							reordered[newName] = {"url": url, "url2": url2, "notes": notes}
-						else:
-							reordered[key] = value
-					self.data[groupName][categoryName] = reordered
-				else:
-					softwareDict[oldName] = {"url": url, "url2": url2, "notes": notes}
-				saveData(self.data)
-				self._populateSoftwareForCategory(groupName, categoryName)
-				self._selectAndFocus(self.softwareList, newName)
-				ui.message(tr("msgEdited"))
+				finalName = oldName
+				softwareDict[oldName] = {"url": url, "url2": url2, "notes": notes}
+
+			removeLocalIgnored(self.data, url)
+			saveData(self.data)
+			self._populateSoftwareForCategory(groupName, categoryName)
+			self._selectAndFocus(self.softwareList, finalName)
+			ui.message(tr("msgEdited"))
 		dlg.Destroy()
 
 	# ---------------------------------------------------------------
@@ -1221,7 +1644,22 @@ class SearchDialog(wx.Dialog):
 		categoryName = self.categoryList.GetString(categoryIndex)
 		name = self.softwareList.GetString(softwareIndex)
 		if confirmYesNo(self, tr("confirmDeleteTitle"), tr("confirmDeleteSoftware", name)):
+			info = self.data[groupName][categoryName][name]
+			url = info.get("url", "")
 			del self.data[groupName][categoryName][name]
+
+			# الحذف المركزي يتطلب: أونلاين + التحقق من المالك + تفعيل Online Design Mode
+			isCloudDelete = (
+				config.conf["qadreen"]["onlineMode"] and
+				getattr(self.plugin, "isRepoOwner", False) and
+				getattr(self.plugin, "onlineDesignMode", False)
+			)
+
+			if isCloudDelete:
+				addCloudDeleted(self.data, url, name, groupName, categoryName)
+			else:
+				addLocalIgnored(self.data, url, name, groupName, categoryName)
+
 			saveData(self.data)
 			self._populateSoftwareForCategory(groupName, categoryName)
 			self.softwareList.SetFocus()
@@ -1267,9 +1705,16 @@ class SearchDialog(wx.Dialog):
 	# ---------------------------------------------------------------
 
 	def runQuickAdd(self, url, closeWhenDone=True):
+		# فحص مبكر: إذا كان رابط الحافظة موجوداً بالفعل، ننبّه ونخرج فوراً
+		if url and isUrlExists(self.data, url):
+			ui.message(tr("msgUrlExists"))
+			if closeWhenDone:
+				self.Close()
+			return
+
 		createNewLabel = tr("createNewChoice")
 
-		groupChoices = [createNewLabel] + sorted(self.data.keys())
+		groupChoices = [createNewLabel] + getGroupNames(self.data)
 		groupName = self._pickOrCreate(
 			tr("quickAddGroupTitle"), tr("groupLabel"), groupChoices,
 			createNewLabel, tr("addGroupTitle"), tr("groupNameLabel")
@@ -1297,10 +1742,15 @@ class SearchDialog(wx.Dialog):
 		dlg = SoftwareDialog(self, tr("addSoftwareTitle"), url=url)
 		if dlg.ShowModal() == wx.ID_OK:
 			name, finalUrl, url2, notes = dlg.GetValuesEntered()
-			softwareDict = self.data.setdefault(groupName, {}).setdefault(categoryName, {})
-			softwareDict[name] = {"url": finalUrl, "url2": url2, "notes": notes}
-			saveData(self.data)
-			ui.message(tr("msgAdded"))
+			if isUrlExists(self.data, finalUrl):
+				ui.message(tr("msgUrlExists"))
+			else:
+				softwareDict = self.data.setdefault(groupName, {}).setdefault(categoryName, {})
+				finalName = getUniqueSoftwareName(softwareDict, name)
+				softwareDict[finalName] = {"url": finalUrl, "url2": url2, "notes": notes}
+				removeLocalIgnored(self.data, finalUrl)
+				saveData(self.data)
+				ui.message(tr("msgAdded"))
 		dlg.Destroy()
 
 		if closeWhenDone:
@@ -1324,7 +1774,7 @@ class SearchDialog(wx.Dialog):
 			return
 		sourceName = self.groupList.GetString(index)
 
-		choices = sorted(name for name in self.data.keys() if name != sourceName)
+		choices = [name for name in getGroupNames(self.data) if name != sourceName]
 		if not choices:
 			ui.message(tr("msgNoOtherGroup"))
 			return
@@ -1351,7 +1801,7 @@ class SearchDialog(wx.Dialog):
 		sourceGroup = self.groupList.GetString(groupIndex)
 		categoryName = self.categoryList.GetString(categoryIndex)
 
-		choices = sorted(name for name in self.data.keys() if name != sourceGroup)
+		choices = [name for name in getGroupNames(self.data) if name != sourceGroup]
 		if not choices:
 			ui.message(tr("msgNoOtherGroup"))
 			return
@@ -1383,7 +1833,7 @@ class SearchDialog(wx.Dialog):
 		sourceCategory = self.categoryList.GetString(categoryIndex)
 		softwareName = self.softwareList.GetString(softwareIndex)
 
-		groupChoices = sorted(self.data.keys())
+		groupChoices = getGroupNames(self.data)
 		targetGroup = self._pickFromList(tr("moveSoftwareGroupTitle"), tr("groupLabel"), groupChoices)
 		if targetGroup is None:
 			return
@@ -1404,7 +1854,9 @@ class SearchDialog(wx.Dialog):
 		message = tr("confirmMoveSoftware", softwareName, targetGroup, targetCategory)
 		if confirmYesNo(self, tr("confirmMoveTitle"), message):
 			info = self.data[sourceGroup][sourceCategory][softwareName]
-			self.data[targetGroup][targetCategory][softwareName] = info
+			targetCategoryDict = self.data.setdefault(targetGroup, {}).setdefault(targetCategory, {})
+			finalName = getUniqueSoftwareName(targetCategoryDict, softwareName)
+			targetCategoryDict[finalName] = info
 			del self.data[sourceGroup][sourceCategory][softwareName]
 			saveData(self.data)
 			self._populateSoftwareForCategory(sourceGroup, sourceCategory)
@@ -1433,6 +1885,9 @@ class SearchDialog(wx.Dialog):
 			if not isinstance(importedData, dict):
 				ui.message(tr("msgImportFailed"))
 			else:
+				# استبعاد مفتاح البيانات الوصفية من أي ملف مستورد يدوياً، لأنه مفهوم
+				# محلي خاص بكل تنصيب على حدة، ولا يجب أن ينتقل أو يُدمج من ملف آخر
+				importedData.pop(METADATA_KEY, None)
 				addedCount, duplicatedCount = mergeData(self.data, importedData)
 				saveData(self.data)
 				self._populateGroups()
@@ -1501,6 +1956,38 @@ class SearchDialog(wx.Dialog):
 		blocks = [self._buildCopyBlock(name, url, url2) for name, url, url2 in self.copiedItems]
 		api.copyToClip("\n\n".join(blocks))
 
+	def _toggleSharing(self, share):
+		if not config.conf["qadreen"]["onlineMode"]:
+			ui.message(tr("msgOnlineModeRequired"))
+			return
+
+		focused = self.FindFocus()
+		if focused == self.groupList:
+			index = self.groupList.GetSelection()
+			if index == wx.NOT_FOUND:
+				ui.message(tr("msgNoGroupSelected"))
+				return
+			path = [self.groupList.GetString(index)]
+		elif focused == self.categoryList:
+			groupIndex = self.groupList.GetSelection()
+			categoryIndex = self.categoryList.GetSelection()
+			if groupIndex == wx.NOT_FOUND or categoryIndex == wx.NOT_FOUND:
+				ui.message(tr("msgNoCategorySelected"))
+				return
+			path = [self.groupList.GetString(groupIndex), self.categoryList.GetString(categoryIndex)]
+		else:
+			ui.message(tr("msgSelectGroupOrCategoryFirst"))
+			return
+
+		if share:
+			addSharedPath(self.data, path)
+			saveData(self.data)
+			ui.message(tr("msgSharingEnabled"))
+		else:
+			removeSharedPath(self.data, path)
+			saveData(self.data)
+			ui.message(tr("msgSharingDisabled"))
+
 
 # =====================================================================
 # صفحة إعدادات لغة الإضافة داخل NVDA Settings
@@ -1533,10 +2020,85 @@ class QadreenSettingsPanel(gui.settingsDialogs.SettingsPanel):
 			currentIndex = 0
 		self.languageChoice.SetSelection(currentIndex)
 
+		# Radio Box for Operation Mode (Offline/Online)
+		self.modeChoices = [tr("settingsOfflineMode"), tr("settingsOnlineMode")]
+		self.modeRadioBox = sizerHelper.addItem(
+			wx.RadioBox(self, label=tr("settingsModeLabel"), choices=self.modeChoices)
+		)
+		self.modeRadioBox.SetSelection(1 if config.conf["qadreen"]["onlineMode"] else 0)
+		self.modeRadioBox.Bind(wx.EVT_RADIOBOX, self.onModeChanged)
+
+		# Cloud Sync Fields (Gist ID and PAT)
+		self.gistIdCtrl = sizerHelper.addLabeledControl(tr("settingsGistIdLabel"), wx.TextCtrl)
+		self.gistIdCtrl.SetValue(config.conf["qadreen"]["gistId"])
+
+		self.patCtrl = sizerHelper.addLabeledControl(
+			tr("settingsPatLabel"), wx.TextCtrl, style=wx.TE_PASSWORD
+		)
+		self.patCtrl.SetValue(crypto_manager.decrypt_token(config.conf["qadreen"]["pat"]))
+
+		# Security Warning Label
+		warningLabel = wx.StaticText(self, label=tr("settingsPatWarning"))
+		sizerHelper.addItem(warningLabel)
+
+		# Sync source: Gist or repository.
+		self.sourceTypeChoices = [tr("settingsSourceGist"), tr("settingsSourceRepo")]
+		self.sourceTypeRadioBox = sizerHelper.addItem(
+			wx.RadioBox(self, label=tr("settingsSourceTypeLabel"), choices=self.sourceTypeChoices)
+		)
+		self.sourceTypeRadioBox.SetSelection(
+			1 if config.conf["qadreen"]["sourceType"] == "repo" else 0
+		)
+		self.sourceTypeRadioBox.Bind(wx.EVT_RADIOBOX, self.onSourceTypeChanged)
+
+		self.repoOwnerNameCtrl = sizerHelper.addLabeledControl(
+			tr("settingsRepoOwnerNameLabel"), wx.TextCtrl
+		)
+		self.repoOwnerNameCtrl.SetValue(config.conf["qadreen"]["repoOwnerName"])
+
+		self.repoPathCtrl = sizerHelper.addLabeledControl(
+			tr("settingsRepoPathLabel"), wx.TextCtrl
+		)
+		self.repoPathCtrl.SetValue(config.conf["qadreen"]["repoPath"])
+
+		self.repoBranchCtrl = sizerHelper.addLabeledControl(
+			tr("settingsRepoBranchLabel"), wx.TextCtrl
+		)
+		self.repoBranchCtrl.SetValue(config.conf["qadreen"]["repoBranch"])
+
+		self.repoPatCtrl = sizerHelper.addLabeledControl(
+			tr("settingsRepoPatLabel"), wx.TextCtrl, style=wx.TE_PASSWORD
+		)
+		self.repoPatCtrl.SetValue(crypto_manager.decrypt_token(config.conf["qadreen"]["repoPat"]))
+
+		repoWarningLabel = wx.StaticText(self, label=tr("settingsRepoPatWarning"))
+		sizerHelper.addItem(repoWarningLabel)
+
+		# Initialize the enabled/disabled state based on current selection
+		self._updateOnlineFieldsState()
+
 		self.contactButton = sizerHelper.addItem(
 			wx.Button(self, label=tr("contactDeveloperButton"))
 		)
 		self.contactButton.Bind(wx.EVT_BUTTON, self.onContactDeveloper)
+
+	def onModeChanged(self, event):
+		self._updateOnlineFieldsState()
+
+	def onSourceTypeChanged(self, event):
+		self._updateOnlineFieldsState()
+
+	def _updateOnlineFieldsState(self):
+		isOnline = self.modeRadioBox.GetSelection() == 1
+		isRepo = self.sourceTypeRadioBox.GetSelection() == 1
+
+		self.sourceTypeRadioBox.Enable(isOnline)
+		self.gistIdCtrl.Enable(isOnline and not isRepo)
+		self.patCtrl.Enable(isOnline and not isRepo)
+		self.repoOwnerNameCtrl.Enable(isOnline and isRepo)
+		self.repoPathCtrl.Enable(isOnline and isRepo)
+		self.repoBranchCtrl.Enable(isOnline and isRepo)
+		self.repoPatCtrl.Enable(isOnline and isRepo)
 
 	def onContactDeveloper(self, event):
 		email = "saedmohamed.n2210@gmail.com"
@@ -1548,23 +2110,517 @@ class QadreenSettingsPanel(gui.settingsDialogs.SettingsPanel):
 		if selectedIndex != wx.NOT_FOUND:
 			config.conf["qadreen"]["language"] = self._languageOptions[selectedIndex]
 
+		config.conf["qadreen"]["onlineMode"] = (self.modeRadioBox.GetSelection() == 1)
+		config.conf["qadreen"]["gistId"] = self.gistIdCtrl.GetValue().strip()
+		config.conf["qadreen"]["pat"] = crypto_manager.encrypt_token(self.patCtrl.GetValue().strip())
+		config.conf["qadreen"]["sourceType"] = (
+			"repo" if self.sourceTypeRadioBox.GetSelection() == 1 else "gist"
+		)
+		config.conf["qadreen"]["repoOwnerName"] = self.repoOwnerNameCtrl.GetValue().strip()
+		config.conf["qadreen"]["repoPath"] = self.repoPathCtrl.GetValue().strip()
+		config.conf["qadreen"]["repoBranch"] = self.repoBranchCtrl.GetValue().strip()
+		config.conf["qadreen"]["repoPat"] = crypto_manager.encrypt_token(self.repoPatCtrl.GetValue().strip())
+
+
+# =====================================================================
+# محرك المزامنة السحابية التعاونية (GitHub Gist)
+# =====================================================================
+
+GIST_FILENAME = "qadreen_data.json"
+GIST_API_URL_TEMPLATE = "https://api.github.com/gists/{}"
+CONTENTS_API_URL_TEMPLATE = "https://api.github.com/repos/{}/contents/{}"
+GITHUB_USER_API = "https://api.github.com/user"
+SYNC_INTERVAL_SECONDS = 6 * 60 * 60  # 21600 seconds (6 hours)
+syncLock = threading.Lock()
+
+
+def fetchCloudData(gistId, pat):
+	request = urllib.request.Request(
+		GIST_API_URL_TEMPLATE.format(gistId),
+		headers={
+			"Authorization": "token {}".format(pat),
+			"Accept": "application/vnd.github+json",
+			"User-Agent": "Qadreen-NVDA-Addon",
+		}
+	)
+	with urllib.request.urlopen(request, timeout=20) as response:
+		gistData = json.loads(response.read().decode("utf-8"))
+
+	fileInfo = gistData.get("files", {}).get(GIST_FILENAME)
+	if fileInfo is None:
+		return {}
+	content = fileInfo.get("content", "").strip()
+	return json.loads(content) if content else {}
+
+
+def pushCloudData(gistId, pat, payload):
+	body = json.dumps({
+		"files": {
+			GIST_FILENAME: {
+				"content": json.dumps(payload, ensure_ascii=False, indent="\t")
+			}
+		}
+	}).encode("utf-8")
+
+	request = urllib.request.Request(
+		GIST_API_URL_TEMPLATE.format(gistId),
+		data=body,
+		method="PATCH",
+		headers={
+			"Authorization": "token {}".format(pat),
+			"Accept": "application/vnd.github+json",
+			"Content-Type": "application/json",
+			"User-Agent": "Qadreen-NVDA-Addon",
+		}
+	)
+	with urllib.request.urlopen(request, timeout=20) as response:
+		response.read()  # Execute request, response content is not needed
+
+
+def _buildEncodedRepoPath(rawPath):
+	"""Clean and encode each repository-path component separately."""
+	cleanPath = rawPath.strip().strip("/") or GIST_FILENAME
+	return "/".join(urllib.parse.quote(part) for part in cleanPath.split("/"))
+
+
+def fetchRepoData(ownerName, path, branch, pat):
+	"""Return repository data and its current SHA; a missing file is empty data."""
+	encodedPath = _buildEncodedRepoPath(path)
+	url = "{}?ref={}".format(
+		CONTENTS_API_URL_TEMPLATE.format(ownerName, encodedPath),
+		urllib.parse.quote(branch)
+	)
+	request = urllib.request.Request(
+		url,
+		headers={
+			"Authorization": "token {}".format(pat),
+			"Accept": "application/vnd.github+json",
+			"User-Agent": "Qadreen-NVDA-Addon",
+		}
+	)
+	try:
+		with urllib.request.urlopen(request, timeout=20) as response:
+			fileInfo = json.loads(response.read().decode("utf-8"))
+	except urllib.error.HTTPError as e:
+		if e.code == 404:
+			return {}, None
+		raise
+
+	content = base64.b64decode(fileInfo["content"]).decode("utf-8").strip()
+	data = json.loads(content) if content else {}
+	return data, fileInfo["sha"]
+
+
+def pushRepoData(ownerName, path, branch, pat, payload, previousSha):
+	"""Upload data to a repository file using the SHA obtained during fetch."""
+	encodedPath = _buildEncodedRepoPath(path)
+	url = CONTENTS_API_URL_TEMPLATE.format(ownerName, encodedPath)
+	body = {
+		"message": "Qadreen data sync",
+		"content": base64.b64encode(
+			json.dumps(payload, ensure_ascii=False, indent="\t").encode("utf-8")
+		).decode("ascii"),
+		"branch": branch,
+	}
+	if previousSha is not None:
+		body["sha"] = previousSha
+
+	request = urllib.request.Request(
+		url,
+		data=json.dumps(body).encode("utf-8"),
+		method="PUT",
+		headers={
+			"Authorization": "token {}".format(pat),
+			"Accept": "application/vnd.github+json",
+			"Content-Type": "application/json",
+			"User-Agent": "Qadreen-NVDA-Addon",
+		}
+	)
+	with urllib.request.urlopen(request, timeout=20) as response:
+		response.read()
+
+
+def authenticateRepoUser(repoOwnerName, repoPat):
+	"""
+	التحقق من هوية مستخدم GitHub عبر طلب GET إلى https://api.github.com/user
+	واستخراج اسم المالك الفعلي من صيغة (owner/repository) ومقارنته بقيمة login.
+	
+	تعيد (True, "owner") إذا تطابق المستخدم مع المالك.
+	تعيد (False, "collaborator") إذا نجح التحقق ولكن المستخدم مختلف عن المالك.
+	تعيد (False, "error") في حال فشل الاتصال أو عدم صحة التوكن أو خطأ في البيانات.
+	"""
+	cleanOwner = repoOwnerName.strip().lower()
+	cleanPat = repoPat.strip()
+	if not cleanOwner or not cleanPat:
+		return False, "error"
+
+	actualOwner = cleanOwner.split("/", 1)[0].strip()
+	if not actualOwner:
+		return False, "error"
+
+	request = urllib.request.Request(
+		GITHUB_USER_API,
+		headers={
+			"Authorization": "token {}".format(cleanPat),
+			"Accept": "application/vnd.github+json",
+			"User-Agent": "Qadreen-NVDA-Addon",
+		}
+	)
+	try:
+		with urllib.request.urlopen(request, timeout=15) as response:
+			userData = json.loads(response.read().decode("utf-8"))
+		login = userData.get("login", "")
+		if login and login.strip().lower() == actualOwner:
+			return True, "owner"
+		return False, "collaborator"
+	except Exception as e:
+		log.error("Qadreen: GitHub user authentication failed: {}".format(e))
+		return False, "error"
+
+
+def getDatasetUrls(data):
+	"""جمع كافة الروابط الموجودة في هيكل البيانات (مع تجاهل المفتاح الوصفي __metadata__)."""
+	urls = set()
+	for groupName, categories in data.items():
+		if groupName == METADATA_KEY or not isinstance(categories, dict):
+			continue
+		for categoryName, softwareDict in categories.items():
+			if not isinstance(softwareDict, dict):
+				continue
+			for softwareName, info in softwareDict.items():
+				if isinstance(info, dict):
+					url = info.get("url", "").strip()
+					if url:
+						urls.add(url)
+	return urls
+
+
+def removeSoftwareByUrls(data, urlsToRemove):
+	"""
+	حذف أي برنامج يحمل أحد الروابط المحددة من البيانات المحلية.
+	يتم التنظيف التلقائي للفئات والمجموعات الفارغة فقط إذا تم إفراغها بواسطة هذه الدالة،
+	مع الحفاظ المطلق على القوالب الفارغة مسبقاً.
+	"""
+	if not urlsToRemove:
+		return False
+
+	urlsSet = set(u.strip() for u in urlsToRemove if u.strip())
+	changed = False
+
+	for groupName, categories in list(data.items()):
+		if groupName == METADATA_KEY or not isinstance(categories, dict):
+			continue
+
+		group_changed = False
+		for categoryName, softwareDict in list(categories.items()):
+			if not isinstance(softwareDict, dict):
+				continue
+
+			category_changed = False
+			for softwareName, info in list(softwareDict.items()):
+				if isinstance(info, dict) and info.get("url", "").strip() in urlsSet:
+					del softwareDict[softwareName]
+					category_changed = True
+					group_changed = True
+					changed = True
+
+			# الحذف الآمن: نحذف الفئة فقط إذا كانت فارغة *وبسبب* تدخلنا المباشر في هذه الدورة
+			if category_changed and not softwareDict:
+				del categories[categoryName]
+
+		# الحذف الآمن للمجموعة: فقط إذا فرغت *وبسبب* تدخلنا المباشر
+		if group_changed and not categories:
+			del data[groupName]
+
+	return changed
+
+
+def mergeCloudToLocal(localData, cloudData):
+	"""
+	دمج البيانات السحابية داخل البيانات المحلية مع مراعاة:
+	1. المانع الوحيد لدخول السحابة هو cloud_deleted_urls.
+	2. سيادة السحابة: التعديل المركزي ينسخ أو يمسح التعديل/الحذف المحلي.
+	"""
+	cloudTombstones = set(item.get("url", "").strip() for item in getCloudDeleted(cloudData))
+
+	addedCount = 0
+	for groupName, categories in cloudData.items():
+		if groupName == METADATA_KEY or not isinstance(categories, dict):
+			continue
+		for categoryName, softwareDict in categories.items():
+			if not isinstance(softwareDict, dict):
+				continue
+			for softwareName, info in softwareDict.items():
+				if not isinstance(info, dict):
+					continue
+				url = info.get("url", "").strip()
+				if not url or url in cloudTombstones:
+					continue
+
+				removeSoftwareByUrls(localData, [url])
+				removeLocalIgnored(localData, url)
+
+				targetGroup = localData.setdefault(groupName, {})
+				targetCategory = targetGroup.setdefault(categoryName, {})
+				finalName = getUniqueSoftwareName(targetCategory, softwareName)
+				targetCategory[finalName] = copy.deepcopy(info)
+				addedCount += 1
+
+	return addedCount
+
+
+def _buildSharedLocalData(localData):
+	"""تجميع المجموعات والفئات المشتركة محلياً فقط لرفعها، مع استبعاد أي روابط محظورة محلياً."""
+	sharedLocalData = {}
+	localIgnoredUrls = set(item.get("url", "").strip() for item in getLocalIgnored(localData))
+
+	for path in getSharedItems(localData):
+		if len(path) == 1:
+			groupName = path[0]
+			if groupName in localData and isinstance(localData[groupName], dict):
+				for catName, sDict in localData[groupName].items():
+					if not isinstance(sDict, dict):
+						continue
+					filteredDict = {
+						sName: copy.deepcopy(sInfo)
+						for sName, sInfo in sDict.items()
+						if isinstance(sInfo, dict) and sInfo.get("url", "").strip() and sInfo.get("url", "").strip() not in localIgnoredUrls
+					}
+					if filteredDict:
+						sharedLocalData.setdefault(groupName, {})[catName] = filteredDict
+		elif len(path) == 2:
+			groupName, categoryName = path
+			if groupName in localData and categoryName in localData.get(groupName, {}):
+				sDict = localData[groupName][categoryName]
+				if isinstance(sDict, dict):
+					filteredDict = {
+						sName: copy.deepcopy(sInfo)
+						for sName, sInfo in sDict.items()
+						if isinstance(sInfo, dict) and sInfo.get("url", "").strip() and sInfo.get("url", "").strip() not in localIgnoredUrls
+					}
+					if filteredDict:
+						sharedLocalData.setdefault(groupName, {})[categoryName] = filteredDict
+	return sharedLocalData
+
+
+def buildSyncPayload(cloudData, localData, isCentralAuthority):
+	"""
+	بناء حمولة البيانات الجاهزة للرفع إلى السحابة بحسب نوع الصلاحية:
+	- Central Authority (Owner في Online Design Mode):
+	  يحق له رفع التعديلات على البرامج المشتركة الحالية، وتحديث قائمة المحذوفات المركزية cloud_deleted_urls، وتطهير السحابة من البرامج المحذوفة.
+	- Collaborator (المتعاون):
+	  يرفع فقط البرامج الجديدة التي لا يوجد لها رابط في السحابة ولا في المحذوفات المركزية، ولا يمس المحذوفات السحابية إطلاقاً.
+	- كلا الوضعين: لا تُرفع local_ignored_urls إلى السحابة أبداً.
+	"""
+	payload = copy.deepcopy(cloudData)
+	sharedLocalData = _buildSharedLocalData(localData)
+
+	if isCentralAuthority:
+		# دمج المحذوفات المركزية المحلية في السحابة
+		localCloudDeleted = getCloudDeleted(localData)
+		for item in localCloudDeleted:
+			url = item.get("url", "").strip()
+			if url:
+				addCloudDeleted(payload, url, item.get("name", ""), item.get("group", ""), item.get("category", ""))
+
+		# تطبيق المحذوفات المركزية على حمولة الرفع وتطهيرها من أي برامج محذوفة
+		cloudTombstones = set(item.get("url", "").strip() for item in getCloudDeleted(payload))
+		removeSoftwareByUrls(payload, cloudTombstones)
+
+		# رفع كافة البرامج المشتركة المحلية (إضافة جديدة أو تحديث تعديلات مركزية)
+		for groupName, categories in sharedLocalData.items():
+			for categoryName, softwareDict in categories.items():
+				for softwareName, info in softwareDict.items():
+					url = info.get("url", "").strip()
+					if not url or url in cloudTombstones:
+						continue
+					removeSoftwareByUrls(payload, [url])
+					targetGroup = payload.setdefault(groupName, {})
+					targetCategory = targetGroup.setdefault(categoryName, {})
+					finalName = getUniqueSoftwareName(targetCategory, softwareName)
+					targetCategory[finalName] = copy.deepcopy(info)
+	else:
+		# وضع المتعاون: لا يمس المحذوفات السحابية ولا يعدل برامج السحابة الحالية
+		existingCloudUrls = getDatasetUrls(cloudData)
+		cloudTombstones = set(item.get("url", "").strip() for item in getCloudDeleted(cloudData))
+
+		for groupName, categories in sharedLocalData.items():
+			for categoryName, softwareDict in categories.items():
+				for softwareName, info in softwareDict.items():
+					url = info.get("url", "").strip()
+					if not url or url in existingCloudUrls or url in cloudTombstones:
+						continue
+					targetGroup = payload.setdefault(groupName, {})
+					targetCategory = targetGroup.setdefault(categoryName, {})
+					finalName = getUniqueSoftwareName(targetCategory, softwareName)
+					targetCategory[finalName] = copy.deepcopy(info)
+
+	# حماية الخصوصية ومنع تسريب local_ignored_urls نهائياً إلى السحابة
+	if METADATA_KEY in payload:
+		payload[METADATA_KEY].pop("local_ignored_urls", None)
+		if not payload[METADATA_KEY]:
+			payload.pop(METADATA_KEY, None)
+
+	return payload
+
+
+def fetchRemoteData(sourceType, conf):
+	"""جلب البيانات السحابية الحالية وقيمة SHA إن وجدت."""
+	if sourceType == "repo":
+		ownerName = conf["repoOwnerName"].strip()
+		path = conf["repoPath"].strip() or GIST_FILENAME
+		branch = conf["repoBranch"].strip() or "main"
+		pat = crypto_manager.decrypt_token(conf["repoPat"].strip())
+		if not ownerName or not pat:
+			return None, None
+		return fetchRepoData(ownerName, path, branch, pat)
+	else:
+		gistId = conf["gistId"].strip()
+		pat = crypto_manager.decrypt_token(conf["pat"].strip())
+		if not gistId or not pat:
+			return None, None
+		cloudData = fetchCloudData(gistId, pat)
+		return cloudData, None
+
+
+def pushRemoteData(sourceType, conf, payload, previousSha=None):
+	"""رفع حمولة البيانات إلى السحابة."""
+	if sourceType == "repo":
+		ownerName = conf["repoOwnerName"].strip()
+		path = conf["repoPath"].strip() or GIST_FILENAME
+		branch = conf["repoBranch"].strip() or "main"
+		pat = crypto_manager.decrypt_token(conf["repoPat"].strip())
+		pushRepoData(ownerName, path, branch, pat, payload, previousSha)
+	else:
+		gistId = conf["gistId"].strip()
+		pat = crypto_manager.decrypt_token(conf["pat"].strip())
+		pushCloudData(gistId, pat, payload)
+
+
+def performSync(pluginInstance=None):
+	"""
+	تنفيذ دورة المزامنة السحابية وفق سياسة سيادة السحابة وصلاحيات المستخدم:
+	1. منع التزامن المتعدد بواسطة syncLock غير معطل للواجهة.
+	2. استيراد المحذوفات السحابية وتطهير البيانات المحلية منها.
+	3. دمج البيانات السحابية مع تفوق السحابة في التحديث المركزي.
+	4. بناء حمولة الرفع حسب صلاحية المستخدم (Central Authority أو Collaborator).
+	5. معالجة تعارضات المستودع (409/422) بإعادة المحاولة لمرة واحدة بـ SHA حديث.
+	"""
+	if not config.conf["qadreen"]["onlineMode"]:
+		return
+
+	if not syncLock.acquire(blocking=False):
+		log.info("Qadreen: Sync is already in progress, skipping overlapping execution.")
+		return
+
+	try:
+		sourceType = config.conf["qadreen"]["sourceType"]
+		qadreenConf = config.conf["qadreen"]
+
+		isCentralAuthority = bool(
+			pluginInstance
+			and getattr(pluginInstance, "isRepoOwner", False)
+			and getattr(pluginInstance, "onlineDesignMode", False)
+		)
+
+		cloudData, sha = fetchRemoteData(sourceType, qadreenConf)
+		if cloudData is None:
+			return
+
+		localData = loadData()
+
+		# استيراد المحذوفات السحابية المركزية إلى السجلات المحلية وتطهير localData منها
+		remoteTombstones = getCloudDeleted(cloudData)
+		for item in remoteTombstones:
+			url = item.get("url", "").strip()
+			if url:
+				addCloudDeleted(localData, url, item.get("name", ""), item.get("group", ""), item.get("category", ""))
+
+		allTombstones = set(item.get("url", "").strip() for item in getCloudDeleted(localData))
+		removeSoftwareByUrls(localData, allTombstones)
+
+		# دمج البيانات السحابية وفق قاعدة Cloud is the Boss
+		mergeCloudToLocal(localData, cloudData)
+		saveData(localData)
+		if pluginInstance is not None:
+			pluginInstance.data = localData
+
+		payload = buildSyncPayload(cloudData, localData, isCentralAuthority)
+
+		try:
+			pushRemoteData(sourceType, qadreenConf, payload, sha)
+		except urllib.error.HTTPError as e:
+			if sourceType == "repo" and e.code in (409, 422):
+				log.info("Qadreen: Remote conflict (%s), retrying sync once with fresh SHA", e.code)
+				cloudData, sha = fetchRemoteData(sourceType, qadreenConf)
+				if cloudData is not None:
+					remoteTombstones = getCloudDeleted(cloudData)
+					for item in remoteTombstones:
+						url = item.get("url", "").strip()
+						if url:
+							addCloudDeleted(localData, url, item.get("name", ""), item.get("group", ""), item.get("category", ""))
+					allTombstones = set(item.get("url", "").strip() for item in getCloudDeleted(localData))
+					removeSoftwareByUrls(localData, allTombstones)
+					mergeCloudToLocal(localData, cloudData)
+					saveData(localData)
+					if pluginInstance is not None:
+						pluginInstance.data = localData
+					payload = buildSyncPayload(cloudData, localData, isCentralAuthority)
+					pushRemoteData(sourceType, qadreenConf, payload, sha)
+			else:
+				raise
+	except Exception as e:
+		log.error("Qadreen: performSync encountered an error: %s", e, exc_info=True)
+	finally:
+		syncLock.release()
+
+
+def runSyncCycle(pluginInstance):
+	performSync(pluginInstance)
+	scheduleSyncTimer(pluginInstance)
+
+
+def scheduleSyncTimer(pluginInstance):
+	if not config.conf["qadreen"]["onlineMode"]:
+		return
+	if getattr(pluginInstance, "_syncTimer", None) is not None:
+		try:
+			pluginInstance._syncTimer.cancel()
+		except Exception:
+			pass
+		pluginInstance._syncTimer = None
+	timer = threading.Timer(SYNC_INTERVAL_SECONDS, runSyncCycle, args=(pluginInstance,))
+	timer.daemon = True
+	pluginInstance._syncTimer = timer
+	timer.start()
+
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	scriptCategory = "Qadreen"
 
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
-		restoreDataBackupIfNeeded()
 		self.data = loadData()
 		self._dialog = None
 		self._helpDialog = None
+		self._deletedItemsDialog = None
+		self.isRepoOwner = False
+		self.onlineDesignMode = False
+		self._authInProgress = False
+		self._isTerminated = False
 		if QadreenSettingsPanel not in gui.NVDASettingsDialog.categoryClasses:
 			gui.NVDASettingsDialog.categoryClasses.append(QadreenSettingsPanel)
 		threading.Thread(target=checkForUpdateInBackground, daemon=True).start()
+		self._syncTimer = None
+		if config.conf["qadreen"]["onlineMode"]:
+			# مزامنة فورية عند الإقلاع في خيط منفصل
+			threading.Thread(target=performSync, args=(self,), daemon=True).start()
+			scheduleSyncTimer(self)
 
 	@script(
-		# الوصف يُبنى ديناميكياً باللغة الحالية عند تسجيل الاختصار في Input Gestures
-		description=STRINGS["scriptDescription"]["ar"],
+		# يُحدد وصف الاختصار عند تحميل الإضافة وفقًا للغة Qadreen الحالية.
+		# يتطلب تغيير الوصف في Input Gestures إعادة تشغيل NVDA.
+		description=tr("scriptDescription"),
 		gesture="kb:NVDA+control+q"
 	)
 	def script_openQuickSearch(self, gesture):
@@ -1579,7 +2635,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		self.data = loadData()
 
 		parentWindow = wx.GetApp().TopWindow if wx.GetApp() else None
-		self._dialog = SearchDialog(parentWindow, self.data)
+		self._dialog = SearchDialog(parentWindow, self.data, plugin=self)
 		self._dialog.Bind(wx.EVT_CLOSE, self._onDialogClose)
 		self._dialog.Show()
 		wx.CallAfter(self._dialog.searchCtrl.SetFocus)
@@ -1590,30 +2646,28 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			self._dialog = None
 
 	@script(
-		description="فتح نافذة مساعدة الإضافة",
+		description=tr("helpScriptDescription"),
 		gesture="kb:NVDA+control+h"
 	)
 	def script_openHelp(self, gesture):
-		if self._helpDialog is not None:
+		if getattr(self, "_helpDialog", None) is not None:
 			try:
 				self._helpDialog.Raise()
 				return
 			except RuntimeError:
 				self._helpDialog = None
 
-		parentWindow = wx.GetApp().TopWindow if wx.GetApp() else None
-		self._helpDialog = HelpDialog(parentWindow)
+		self._helpDialog = HelpDialog(gui.mainFrame)
 		self._helpDialog.Bind(wx.EVT_CLOSE, self._onHelpDialogClose)
 		self._helpDialog.Show()
-		wx.CallAfter(self._helpDialog.textCtrl.SetFocus)
 
-	def _onHelpDialogClose(self, event):
-		if self._helpDialog is not None:
+	def _onHelpDialogClose(self, evt):
+		if self._helpDialog:
 			self._helpDialog.Destroy()
 			self._helpDialog = None
 
 	@script(
-		description="إضافة رابط سريع من الحافظة إلى إضافة قادرين",
+		description=tr("quickAddScriptDescription"),
 		gesture="kb:NVDA+shift+c"
 	)
 	def script_quickAddFromClipboard(self, gesture):
@@ -1629,7 +2683,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		if self._dialog is None:
 			self.data = loadData()
 			parentWindow = wx.GetApp().TopWindow if wx.GetApp() else None
-			self._dialog = SearchDialog(parentWindow, self.data, startMode="design")
+			self._dialog = SearchDialog(parentWindow, self.data, startMode="design", plugin=self)
 			self._dialog.Bind(wx.EVT_CLOSE, self._onDialogClose)
 			self._dialog.Show()
 		elif self._dialog.mode != "design":
@@ -1637,7 +2691,88 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 		wx.CallAfter(self._dialog.runQuickAdd, clipboardText, not wasAlreadyOpen)
 
+	@script(
+		description=tr("deletedItemsScriptDescription"),
+		gesture="kb:control+-"
+	)
+	def script_openDeletedItems(self, gesture):
+		if self._deletedItemsDialog is not None:
+			try:
+				self._deletedItemsDialog.Raise()
+				return
+			except RuntimeError:
+				self._deletedItemsDialog = None
+
+		self.data = loadData()
+		parentWindow = wx.GetApp().TopWindow if wx.GetApp() else None
+		self._deletedItemsDialog = DeletedItemsDialog(parentWindow, self.data, self)
+		self._deletedItemsDialog.Bind(wx.EVT_CLOSE, self._onDeletedItemsDialogClose)
+		self._deletedItemsDialog.Show()
+
+	def _onDeletedItemsDialogClose(self, event):
+		if self._deletedItemsDialog is not None:
+			self._deletedItemsDialog.Destroy()
+			self._deletedItemsDialog = None
+
+	@script(
+		description=tr("onlineDesignModeScriptDescription"),
+		gesture="kb:control+shift+d"
+	)
+	def script_toggleOnlineDesignMode(self, gesture):
+		if not config.conf["qadreen"]["onlineMode"]:
+			ui.message(tr("msgOnlineDesignOffline"))
+			return
+
+		if self.onlineDesignMode:
+			self.onlineDesignMode = False
+			ui.message(tr("msgOnlineDesignModeDisabled"))
+			return
+
+		if self._authInProgress:
+			ui.message(tr("msgAuthInProgress"))
+			return
+
+		repoOwnerName = config.conf["qadreen"]["repoOwnerName"].strip()
+		repoPat = crypto_manager.decrypt_token(config.conf["qadreen"]["repoPat"].strip())
+		if not repoOwnerName or not repoPat:
+			ui.message(tr("msgGitHubCredentialsMissing"))
+			return
+
+		ui.message(tr("msgVerifyingUser"))
+		self._authInProgress = True
+
+		def worker():
+			isOwner, reason = authenticateRepoUser(repoOwnerName, repoPat)
+			wx.CallAfter(self._onAuthFinished, isOwner, reason)
+
+		threading.Thread(target=worker, daemon=True).start()
+
+	def _onAuthFinished(self, isOwner, reason):
+		if getattr(self, "_isTerminated", False):
+			return
+		self._authInProgress = False
+		if isOwner:
+			self.isRepoOwner = True
+			self.onlineDesignMode = True
+			ui.message(tr("msgOnlineDesignModeEnabled"))
+			if config.conf["qadreen"]["onlineMode"]:
+				threading.Thread(target=performSync, args=(self,), daemon=True).start()
+		elif reason == "collaborator":
+			self.isRepoOwner = False
+			self.onlineDesignMode = False
+			ui.message(tr("msgOwnerOnly"))
+		else:
+			self.isRepoOwner = False
+			self.onlineDesignMode = False
+			ui.message(tr("msgAuthFailed"))
+
 	def terminate(self, *args, **kwargs):
+		self._isTerminated = True
+		if getattr(self, "_deletedItemsDialog", None) is not None:
+			self._deletedItemsDialog.Destroy()
+			self._deletedItemsDialog = None
+		if getattr(self, "_syncTimer", None) is not None:
+			self._syncTimer.cancel()
 		super().terminate(*args, **kwargs)
 		if QadreenSettingsPanel in gui.NVDASettingsDialog.categoryClasses:
 			gui.NVDASettingsDialog.categoryClasses.remove(QadreenSettingsPanel)
