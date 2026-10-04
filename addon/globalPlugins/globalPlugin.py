@@ -266,6 +266,22 @@ STRINGS = {
 		"ar": "تمت إزالة العنصر من قائمة المحذوفات",
 		"en": "Item removed from blacklist"
 	},
+	"syncNowButton": {
+		"ar": "مزامنة الآن",
+		"en": "Sync Now"
+	},
+	"msgSyncSuccess": {
+		"ar": "تمت مزامنة البيانات بنجاح",
+		"en": "Data synchronized successfully"
+	},
+	"msgSyncFailed": {
+		"ar": "تعذر إتمام المزامنة",
+		"en": "Synchronization failed"
+	},
+	"msgSyncInProgress": {
+		"ar": "المزامنة جارية بالفعل، يرجى الانتظار",
+		"en": "Synchronization is already in progress, please wait"
+	},
 }
 
 
@@ -534,6 +550,54 @@ def removeCloudDeleted(data, url):
 		return
 	items = getCloudDeleted(data)
 	items[:] = [item for item in items if item.get("url") != cleanUrl]
+
+
+def getLastSyncedData(data):
+	"""الحصول على آخر حالة سحابية ناجحة تمت مزامنتها من __metadata__."""
+	if not isinstance(data, dict):
+		return None
+	return data.get(METADATA_KEY, {}).get("last_synced_data", None)
+
+
+def setLastSyncedData(data, syncedCloudData):
+	"""حفظ نسخة مستقلة من الحالة السحابية الناجحة فعلياً داخل __metadata__ للمالك المركزي."""
+	if not isinstance(data, dict):
+		return
+	metadata = data.setdefault(METADATA_KEY, {})
+	cleanSynced = copy.deepcopy(syncedCloudData)
+	if isinstance(cleanSynced, dict) and METADATA_KEY in cleanSynced:
+		cleanSynced[METADATA_KEY].pop("last_synced_data", None)
+		cleanSynced[METADATA_KEY].pop("owner_sync_pending", None)
+		cleanSynced[METADATA_KEY].pop("local_ignored_urls", None)
+		if not cleanSynced[METADATA_KEY]:
+			cleanSynced.pop(METADATA_KEY, None)
+	metadata["last_synced_data"] = cleanSynced
+
+
+def hasPendingOwnerSync(data):
+	"""فحص ما إذا كانت هناك تعديلات محلية للمالك لم يتم تأكيد رفعها إلى GitHub بعد."""
+	if not isinstance(data, dict):
+		return False
+	return bool(data.get(METADATA_KEY, {}).get("owner_sync_pending", False))
+
+
+def setPendingOwnerSync(data, value):
+	"""تعيين حالة التعديلات المعلقة للمالك داخل __metadata__ محلياً."""
+	if not isinstance(data, dict):
+		return
+	metadata = data.setdefault(METADATA_KEY, {})
+	metadata["owner_sync_pending"] = bool(value)
+
+
+def stripLocalSyncMetadata(data):
+	"""إزالة البيانات الوصفية المحلية الخاصة بالمزامنة من أي كائن بيانات قبل رفعه إلى السحابة."""
+	if isinstance(data, dict) and METADATA_KEY in data:
+		data[METADATA_KEY].pop("last_synced_data", None)
+		data[METADATA_KEY].pop("owner_sync_pending", None)
+		data[METADATA_KEY].pop("local_ignored_urls", None)
+		if not data[METADATA_KEY]:
+			data.pop(METADATA_KEY, None)
+	return data
 
 
 # =====================================================================
@@ -1113,6 +1177,7 @@ class SearchDialog(wx.Dialog):
 			self.searchCtrl.Hide()
 			self.copyButton.Hide()
 			self.importButton.Show()
+		self._updateSyncNowButtonVisibility()
 
 		self.SetSize((560, 420))
 		self.CentreOnScreen()
@@ -1160,9 +1225,12 @@ class SearchDialog(wx.Dialog):
 		self.closeButton = wx.Button(self, label=tr("closeButton"))
 		self.importButton = wx.Button(self, label=tr("importButton"))
 		self.importButton.Hide()
+		self.syncNowButton = wx.Button(self, label=tr("syncNowButton"))
+		self.syncNowButton.Hide()
 		buttonsSizer.Add(self.copyButton, 0, wx.RIGHT, 8)
 		buttonsSizer.Add(self.closeButton, 0, wx.RIGHT, 8)
-		buttonsSizer.Add(self.importButton, 0)
+		buttonsSizer.Add(self.importButton, 0, wx.RIGHT, 8)
+		buttonsSizer.Add(self.syncNowButton, 0)
 
 		mainSizer.Add(self.searchLabel, 0, wx.LEFT | wx.TOP, 8)
 		mainSizer.Add(self.searchCtrl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 8)
@@ -1180,6 +1248,7 @@ class SearchDialog(wx.Dialog):
 		self.copyButton.Bind(wx.EVT_BUTTON, self.onCopyButton)
 		self.closeButton.Bind(wx.EVT_BUTTON, lambda evt: self.Close())
 		self.importButton.Bind(wx.EVT_BUTTON, lambda evt: self._importData())
+		self.syncNowButton.Bind(wx.EVT_BUTTON, self.onSyncNowButton)
 		self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
 
 	# ---------------------------------------------------------------
@@ -1386,6 +1455,92 @@ class SearchDialog(wx.Dialog):
 		self.copyButton.SetLabel(tr("addToCopyButton"))
 		ui.message(tr("msgCopied"))
 
+	def _isCentralOnlineDesignMode(self):
+		"""التحقق مما إذا كانت النافذة في وضع التصميم السحابي المركزي للمالك."""
+		return bool(
+			self.mode == "design" and
+			config.conf["qadreen"]["onlineMode"] and
+			self.plugin and
+			getattr(self.plugin, "isRepoOwner", False) and
+			getattr(self.plugin, "onlineDesignMode", False)
+		)
+
+	def _updateSyncNowButtonVisibility(self):
+		"""إظهار أو إخفاء زر مزامنة الآن وفق شروط وضع التصميم السحابي المركزي فقط."""
+		if hasattr(self, "syncNowButton"):
+			if self._isCentralOnlineDesignMode():
+				self.syncNowButton.Show()
+			else:
+				self.syncNowButton.Hide()
+			self.Layout()
+
+	def onSyncNowButton(self, event=None):
+		"""بدء المزامنة اليدوية للمالك المركزي في خيط خلفي مع حماية syncLock."""
+		if not self._isCentralOnlineDesignMode():
+			return
+		if syncLock.locked():
+			ui.message(tr("msgSyncInProgress"))
+			return
+
+		self.syncNowButton.Disable()
+
+		def syncWorker():
+			success = False
+			try:
+				success = bool(performSync(self.plugin))
+			except Exception as e:
+				log.error("Qadreen: Manual sync error: %s", e, exc_info=True)
+				success = False
+			wx.CallAfter(self._onManualSyncFinished, success)
+
+		threading.Thread(target=syncWorker, daemon=True).start()
+
+	def _onManualSyncFinished(self, success):
+		try:
+			if hasattr(self, "syncNowButton"):
+				self.syncNowButton.Enable()
+		except Exception:
+			pass
+
+		if success:
+			ui.message(tr("msgSyncSuccess"))
+			self.updateDataFromPlugin()
+		else:
+			ui.message(tr("msgSyncFailed"))
+
+	def updateDataFromPlugin(self):
+		"""تحديث بيانات النافذة وقوائمها لتطابق أحدث حالة محلية بعد المزامنة."""
+		if self.plugin and hasattr(self.plugin, "data"):
+			self.data = self.plugin.data
+		else:
+			self.data = loadData()
+		self._refreshViewData()
+
+	def _refreshViewData(self):
+		"""إعادة تعبئة القوائم مع الحفاظ على التحديد الحالي إن أمكن."""
+		currentGroup = self.groupList.GetStringSelection() if self.groupList.GetSelection() != wx.NOT_FOUND else ""
+		currentCategory = self.categoryList.GetStringSelection() if self.categoryList.GetSelection() != wx.NOT_FOUND else ""
+		currentSoftware = self.softwareList.GetStringSelection() if self.softwareList.GetSelection() != wx.NOT_FOUND else ""
+
+		self._populateGroups()
+
+		if currentGroup and currentGroup in self.data:
+			self._selectAndFocus(self.groupList, currentGroup)
+			self._populateCategoriesForGroup(currentGroup)
+			if currentCategory and currentCategory in self.data.get(currentGroup, {}):
+				self._selectAndFocus(self.categoryList, currentCategory)
+				self._populateSoftwareForCategory(currentGroup, currentCategory)
+				if currentSoftware and currentSoftware in self.data.get(currentGroup, {}).get(currentCategory, {}):
+					self._selectAndFocus(self.softwareList, currentSoftware)
+
+	def _saveDataAndSync(self):
+		"""حفظ البيانات محلياً مع وسم التعديلات المعلقة للمالك وإطلاق المزامنة في الخلفية إن كان في الوضع المركزي."""
+		if self._isCentralOnlineDesignMode():
+			setPendingOwnerSync(self.data, True)
+		saveData(self.data)
+		if self._isCentralOnlineDesignMode():
+			threading.Thread(target=performSync, args=(self.plugin,), daemon=True).start()
+
 	# ---------------------------------------------------------------
 	# التبديل بين وضع العرض ووضع التصميم
 	# ---------------------------------------------------------------
@@ -1399,6 +1554,7 @@ class SearchDialog(wx.Dialog):
 			self.searchCtrl.Hide()
 			self.copyButton.Hide()
 			self.importButton.Show()
+			self._updateSyncNowButtonVisibility()
 			ui.message(tr("msgDesignMode"))
 		else:
 			self.mode = "view"
@@ -1407,6 +1563,7 @@ class SearchDialog(wx.Dialog):
 			self.searchCtrl.Show()
 			self.copyButton.Show()
 			self.importButton.Hide()
+			self._updateSyncNowButtonVisibility()
 			ui.message(tr("msgViewMode"))
 
 		self._populateGroups()
@@ -1427,7 +1584,7 @@ class SearchDialog(wx.Dialog):
 				ui.message(tr("msgNameExists"))
 			else:
 				self.data[name] = {}
-				saveData(self.data)
+				self._saveDataAndSync()
 				self._populateGroups()
 				self._selectAndFocus(self.groupList, name)
 				ui.message(tr("msgAdded"))
@@ -1447,7 +1604,7 @@ class SearchDialog(wx.Dialog):
 				ui.message(tr("msgNameExistsInGroup"))
 			else:
 				self.data.setdefault(groupName, {})[name] = {}
-				saveData(self.data)
+				self._saveDataAndSync()
 				self._populateCategoriesForGroup(groupName)
 				self._selectAndFocus(self.categoryList, name)
 				ui.message(tr("msgAdded"))
@@ -1473,7 +1630,7 @@ class SearchDialog(wx.Dialog):
 			finalName = getUniqueSoftwareName(softwareDict, name)
 			softwareDict[finalName] = {"url": url, "url2": url2, "notes": notes}
 			removeLocalIgnored(self.data, url)
-			saveData(self.data)
+			self._saveDataAndSync()
 			self._populateSoftwareForCategory(groupName, categoryName)
 			self._selectAndFocus(self.softwareList, finalName)
 			ui.message(tr("msgAdded"))
@@ -1513,7 +1670,7 @@ class SearchDialog(wx.Dialog):
 						reordered[newName if key == oldName else key] = value
 					self.data.clear()
 					self.data.update(reordered)
-					saveData(self.data)
+					self._saveDataAndSync()
 					self._populateGroups()
 					self._selectAndFocus(self.groupList, newName)
 					ui.message(tr("msgEdited"))
@@ -1540,7 +1697,7 @@ class SearchDialog(wx.Dialog):
 					for key, value in categories.items():
 						reordered[newName if key == oldName else key] = value
 					self.data[groupName] = reordered
-					saveData(self.data)
+					self._saveDataAndSync()
 					self._populateCategoriesForGroup(groupName)
 					self._selectAndFocus(self.categoryList, newName)
 					ui.message(tr("msgEdited"))
@@ -1584,7 +1741,7 @@ class SearchDialog(wx.Dialog):
 				softwareDict[oldName] = {"url": url, "url2": url2, "notes": notes}
 
 			removeLocalIgnored(self.data, url)
-			saveData(self.data)
+			self._saveDataAndSync()
 			self._populateSoftwareForCategory(groupName, categoryName)
 			self._selectAndFocus(self.softwareList, finalName)
 			ui.message(tr("msgEdited"))
@@ -1613,7 +1770,7 @@ class SearchDialog(wx.Dialog):
 		name = self.groupList.GetString(index)
 		if confirmYesNo(self, tr("confirmDeleteTitle"), tr("confirmDeleteGroup", name)):
 			del self.data[name]
-			saveData(self.data)
+			self._saveDataAndSync()
 			self._populateGroups()
 			self.groupList.SetFocus()
 			ui.message(tr("msgDeleted"))
@@ -1628,7 +1785,7 @@ class SearchDialog(wx.Dialog):
 		name = self.categoryList.GetString(categoryIndex)
 		if confirmYesNo(self, tr("confirmDeleteTitle"), tr("confirmDeleteCategory", name)):
 			del self.data[groupName][name]
-			saveData(self.data)
+			self._saveDataAndSync()
 			self._populateCategoriesForGroup(groupName)
 			self.categoryList.SetFocus()
 			ui.message(tr("msgDeleted"))
@@ -1660,7 +1817,7 @@ class SearchDialog(wx.Dialog):
 			else:
 				addLocalIgnored(self.data, url, name, groupName, categoryName)
 
-			saveData(self.data)
+			self._saveDataAndSync()
 			self._populateSoftwareForCategory(groupName, categoryName)
 			self.softwareList.SetFocus()
 			ui.message(tr("msgDeleted"))
@@ -1749,7 +1906,7 @@ class SearchDialog(wx.Dialog):
 				finalName = getUniqueSoftwareName(softwareDict, name)
 				softwareDict[finalName] = {"url": finalUrl, "url2": url2, "notes": notes}
 				removeLocalIgnored(self.data, finalUrl)
-				saveData(self.data)
+				self._saveDataAndSync()
 				ui.message(tr("msgAdded"))
 		dlg.Destroy()
 
@@ -1787,7 +1944,7 @@ class SearchDialog(wx.Dialog):
 		if confirmYesNo(self, tr("confirmMoveTitle"), message):
 			mergeDict(self.data[targetName], self.data[sourceName])
 			del self.data[sourceName]
-			saveData(self.data)
+			self._saveDataAndSync()
 			self._populateGroups()
 			self._selectAndFocus(self.groupList, targetName)
 			ui.message(tr("msgMoved"))
@@ -1818,7 +1975,7 @@ class SearchDialog(wx.Dialog):
 			else:
 				targetCategories[categoryName] = self.data[sourceGroup][categoryName]
 			del self.data[sourceGroup][categoryName]
-			saveData(self.data)
+			self._saveDataAndSync()
 			self._populateCategoriesForGroup(sourceGroup)
 			ui.message(tr("msgMoved"))
 
@@ -1858,7 +2015,7 @@ class SearchDialog(wx.Dialog):
 			finalName = getUniqueSoftwareName(targetCategoryDict, softwareName)
 			targetCategoryDict[finalName] = info
 			del self.data[sourceGroup][sourceCategory][softwareName]
-			saveData(self.data)
+			self._saveDataAndSync()
 			self._populateSoftwareForCategory(sourceGroup, sourceCategory)
 			ui.message(tr("msgMoved"))
 
@@ -1889,7 +2046,7 @@ class SearchDialog(wx.Dialog):
 				# محلي خاص بكل تنصيب على حدة، ولا يجب أن ينتقل أو يُدمج من ملف آخر
 				importedData.pop(METADATA_KEY, None)
 				addedCount, duplicatedCount = mergeData(self.data, importedData)
-				saveData(self.data)
+				self._saveDataAndSync()
 				self._populateGroups()
 				ui.message(tr("msgImportSummary", addedCount, duplicatedCount))
 		dlg.Destroy()
@@ -2403,31 +2560,278 @@ def _buildSharedLocalData(localData):
 	return sharedLocalData
 
 
-def buildSyncPayload(cloudData, localData, isCentralAuthority):
+def _extractSoftwaresMap(data):
+	"""
+	استخراج خريطة لجميع البرامج المفهرسة بالرابط الأساسي url:
+	url -> {
+		"group": groupName,
+		"category": categoryName,
+		"name": softwareName,
+		"info": info_dict
+	}
+	"""
+	res = {}
+	if not isinstance(data, dict):
+		return res
+	for groupName, categories in data.items():
+		if groupName == METADATA_KEY or not isinstance(categories, dict):
+			continue
+		for categoryName, softwareDict in categories.items():
+			if not isinstance(softwareDict, dict):
+				continue
+			for softwareName, info in softwareDict.items():
+				if not isinstance(info, dict):
+					continue
+				url = info.get("url", "").strip()
+				if url:
+					res[url] = {
+						"url": url,
+						"group": groupName,
+						"category": categoryName,
+						"name": softwareName,
+						"info": copy.deepcopy(info)
+					}
+	return res
+
+
+def detectOwnerLocalChanges(lastSyncedData, localData, cloudData=None):
+	"""
+	اكتشاف التغييرات المحلية التي أجراها المالك منذ آخر مزامنة ناجحة:
+	- Add: برامج جديدة
+	- Delete: برامج محذوفة
+	- Edit: تعديل url2 أو notes
+	- Move: نقل من مجموعة أو فئة إلى أخرى
+	- Rename: تغيير اسم البرنامج
+	- URL change: تغيير الرابط الأساسي مع بقاء البرنامج
+	"""
+	changes = {
+		"added": [],
+		"deleted": set(),
+		"modified": [],
+	}
+
+	localMap = _extractSoftwaresMap(localData)
+	localTombstones = set(item.get("url", "").strip() for item in getCloudDeleted(localData))
+
+	if lastSyncedData is None:
+		# أول تشغيل بعد التحديث دون وجود baseline مخزن
+		cloudMap = _extractSoftwaresMap(cloudData) if cloudData else {}
+
+		matchedCloudOldUrls = set()
+		for oldUrl, cItem in cloudMap.items():
+			if oldUrl not in localMap:
+				for newUrl, locItem in localMap.items():
+					if (newUrl not in cloudMap and
+						locItem["group"] == cItem["group"] and
+						locItem["category"] == cItem["category"] and
+						locItem["name"] == cItem["name"]):
+						matchedCloudOldUrls.add(oldUrl)
+						changes["modified"].append({
+							"url": newUrl,
+							"old_url": oldUrl,
+							"group": locItem["group"],
+							"category": locItem["category"],
+							"name": locItem["name"],
+							"info": copy.deepcopy(locItem["info"]),
+							"old_group": cItem["group"],
+							"old_category": cItem["category"],
+							"old_name": cItem["name"],
+							"is_move": False,
+							"is_rename": False,
+						})
+						break
+
+		urlChangeNewUrls = set(c.get("url") for c in changes["modified"] if "old_url" in c)
+		for url, locItem in localMap.items():
+			if url in localTombstones:
+				continue
+			if url in urlChangeNewUrls:
+				continue
+			if url not in cloudMap:
+				changes["added"].append(copy.deepcopy(locItem))
+			else:
+				cItem = cloudMap[url]
+				isDiff = (
+					locItem["group"] != cItem["group"] or
+					locItem["category"] != cItem["category"] or
+					locItem["name"] != cItem["name"] or
+					locItem["info"].get("url2", "").strip() != cItem["info"].get("url2", "").strip() or
+					locItem["info"].get("notes", "").strip() != cItem["info"].get("notes", "").strip()
+				)
+				if isDiff:
+					changes["modified"].append({
+						"url": url,
+						"group": locItem["group"],
+						"category": locItem["category"],
+						"name": locItem["name"],
+						"info": copy.deepcopy(locItem["info"]),
+						"old_group": cItem["group"],
+						"old_category": cItem["category"],
+						"old_name": cItem["name"],
+						"is_move": (locItem["group"] != cItem["group"] or locItem["category"] != cItem["category"]),
+						"is_rename": (locItem["name"] != cItem["name"]),
+					})
+
+		changes["deleted"] = set(localTombstones)
+		return changes
+
+	# الحالة القياسية: وجود lastSyncedData
+	lastMap = _extractSoftwaresMap(lastSyncedData)
+
+	# 1. كشف تعديل الرابط (URL change): برنامج في نفس المكان والاسم تغير رابطه
+	matchedOldUrls = set()
+	for oldUrl, oldItem in lastMap.items():
+		if oldUrl not in localMap:
+			for newUrl, locItem in localMap.items():
+				if (newUrl not in lastMap and
+					locItem["group"] == oldItem["group"] and
+					locItem["category"] == oldItem["category"] and
+					locItem["name"] == oldItem["name"]):
+					matchedOldUrls.add(oldUrl)
+					changes["modified"].append({
+						"url": newUrl,
+						"old_url": oldUrl,
+						"group": locItem["group"],
+						"category": locItem["category"],
+						"name": locItem["name"],
+						"info": copy.deepcopy(locItem["info"]),
+						"old_group": oldItem["group"],
+						"old_category": oldItem["category"],
+						"old_name": oldItem["name"],
+						"is_move": False,
+						"is_rename": False,
+					})
+					break
+
+	# 2. كشف البرامج المحذوفة
+	for oldUrl in lastMap.keys():
+		if oldUrl not in localMap and oldUrl not in matchedOldUrls:
+			changes["deleted"].add(oldUrl)
+	changes["deleted"].update(localTombstones)
+
+	# 3. كشف البرامج المضافة والتعديلات (Move, Rename, Edit)
+	urlChangeNewUrls = set(c.get("url") for c in changes["modified"] if "old_url" in c)
+	for url, locItem in localMap.items():
+		if url in localTombstones:
+			continue
+		if url in urlChangeNewUrls:
+			continue
+		if url not in lastMap:
+			changes["added"].append(copy.deepcopy(locItem))
+		else:
+			oldItem = lastMap[url]
+			isMove = (locItem["group"] != oldItem["group"] or locItem["category"] != oldItem["category"])
+			isRename = (locItem["name"] != oldItem["name"])
+			isInfoChange = (
+				locItem["info"].get("url2", "").strip() != oldItem["info"].get("url2", "").strip() or
+				locItem["info"].get("notes", "").strip() != oldItem["info"].get("notes", "").strip()
+			)
+			if isMove or isRename or isInfoChange:
+				changes["modified"].append({
+					"url": url,
+					"group": locItem["group"],
+					"category": locItem["category"],
+					"name": locItem["name"],
+					"info": copy.deepcopy(locItem["info"]),
+					"old_group": oldItem["group"],
+					"old_category": oldItem["category"],
+					"old_name": oldItem["name"],
+					"is_move": isMove,
+					"is_rename": isRename,
+				})
+
+	return changes
+
+
+def applyOwnerChangesToCloud(cloudData, ownerChanges, localData=None):
+	"""
+	تطبيق تغييرات المالك على النسخة السحابية الحالية:
+	Cloud changes from collaborators + Owner local changes -> Final cloud state
+	مع إعطاء الأولوية لتعديل المالك عند التعارض على نفس البرنامج/الرابط.
+	"""
+	result = copy.deepcopy(cloudData) if isinstance(cloudData, dict) else {}
+
+	# 1. تطبيق الحذف
+	deletedUrls = ownerChanges.get("deleted", set())
+	if deletedUrls:
+		removeSoftwareByUrls(result, deletedUrls)
+
+	# 2. تطبيق التعديلات (Move, Rename, Edit, URL change)
+	for mod in ownerChanges.get("modified", []):
+		url = mod.get("url", "").strip()
+		oldUrl = mod.get("old_url", "").strip()
+		if oldUrl:
+			removeSoftwareByUrls(result, [oldUrl])
+		if url:
+			removeSoftwareByUrls(result, [url])
+
+		groupName = mod["group"]
+		categoryName = mod["category"]
+		softwareName = mod["name"]
+		info = copy.deepcopy(mod["info"])
+
+		targetGroup = result.setdefault(groupName, {})
+		targetCategory = targetGroup.setdefault(categoryName, {})
+		finalName = getUniqueSoftwareName(targetCategory, softwareName)
+		targetCategory[finalName] = info
+
+	# 3. تطبيق الإضافات الجديدة للمالك
+	for add in ownerChanges.get("added", []):
+		url = (add.get("url") or add.get("info", {}).get("url", "")).strip()
+		if not url or url in deletedUrls:
+			continue
+		removeSoftwareByUrls(result, [url])
+
+		groupName = add["group"]
+		categoryName = add["category"]
+		softwareName = add["name"]
+		info = copy.deepcopy(add["info"])
+
+		targetGroup = result.setdefault(groupName, {})
+		targetCategory = targetGroup.setdefault(categoryName, {})
+		finalName = getUniqueSoftwareName(targetCategory, softwareName)
+		targetCategory[finalName] = info
+
+	# 4. الحفاظ على المجموعات والفئات كقوالب (Template Preservation)
+	if localData and isinstance(localData, dict):
+		for gName, cats in localData.items():
+			if gName == METADATA_KEY or not isinstance(cats, dict):
+				continue
+			targetG = result.setdefault(gName, {})
+			for cName in cats.keys():
+				targetG.setdefault(cName, {})
+
+	return result
+
+
+def buildSyncPayload(cloudData, localData, isCentralAuthority, ownerChanges=None):
 	"""
 	بناء حمولة البيانات الجاهزة للرفع إلى السحابة بحسب نوع الصلاحية:
 	- Central Authority (Owner في Online Design Mode):
-	  يحق له رفع التعديلات على البرامج المشتركة الحالية، وتحديث قائمة المحذوفات المركزية cloud_deleted_urls، وتطهير السحابة من البرامج المحذوفة.
+	  الحمولة مبنية من أحدث بيانات سحابية + تغييرات المالك مع الحفاظ على إضافات المتعاونين.
 	- Collaborator (المتعاون):
-	  يرفع فقط البرامج الجديدة التي لا يوجد لها رابط في السحابة ولا في المحذوفات المركزية، ولا يمس المحذوفات السحابية إطلاقاً.
-	- كلا الوضعين: لا تُرفع local_ignored_urls إلى السحابة أبداً.
+	  يرفع فقط البرامج الجديدة التي لا يوجد لها رابط في السحابة ولا في المحذوفات المركزية.
+	- كلا الوضعين: تُحذف last_synced_data و local_ignored_urls من الحمولة قبل الرفع.
 	"""
-	payload = copy.deepcopy(cloudData)
-	sharedLocalData = _buildSharedLocalData(localData)
-
 	if isCentralAuthority:
-		# دمج المحذوفات المركزية المحلية في السحابة
+		if ownerChanges is not None:
+			payload = applyOwnerChangesToCloud(cloudData, ownerChanges, localData)
+		else:
+			lastSynced = getLastSyncedData(localData)
+			changes = detectOwnerLocalChanges(lastSynced, localData, cloudData)
+			payload = applyOwnerChangesToCloud(cloudData, changes, localData)
+
 		localCloudDeleted = getCloudDeleted(localData)
 		for item in localCloudDeleted:
 			url = item.get("url", "").strip()
 			if url:
 				addCloudDeleted(payload, url, item.get("name", ""), item.get("group", ""), item.get("category", ""))
 
-		# تطبيق المحذوفات المركزية على حمولة الرفع وتطهيرها من أي برامج محذوفة
 		cloudTombstones = set(item.get("url", "").strip() for item in getCloudDeleted(payload))
 		removeSoftwareByUrls(payload, cloudTombstones)
 
-		# رفع كافة البرامج المشتركة المحلية (إضافة جديدة أو تحديث تعديلات مركزية)
+		# دمج أي برامج مشتركة محلية متبقية
+		sharedLocalData = _buildSharedLocalData(localData)
 		for groupName, categories in sharedLocalData.items():
 			for categoryName, softwareDict in categories.items():
 				for softwareName, info in softwareDict.items():
@@ -2440,7 +2844,8 @@ def buildSyncPayload(cloudData, localData, isCentralAuthority):
 					finalName = getUniqueSoftwareName(targetCategory, softwareName)
 					targetCategory[finalName] = copy.deepcopy(info)
 	else:
-		# وضع المتعاون: لا يمس المحذوفات السحابية ولا يعدل برامج السحابة الحالية
+		payload = copy.deepcopy(cloudData)
+		sharedLocalData = _buildSharedLocalData(localData)
 		existingCloudUrls = getDatasetUrls(cloudData)
 		cloudTombstones = set(item.get("url", "").strip() for item in getCloudDeleted(cloudData))
 
@@ -2455,12 +2860,7 @@ def buildSyncPayload(cloudData, localData, isCentralAuthority):
 					finalName = getUniqueSoftwareName(targetCategory, softwareName)
 					targetCategory[finalName] = copy.deepcopy(info)
 
-	# حماية الخصوصية ومنع تسريب local_ignored_urls نهائياً إلى السحابة
-	if METADATA_KEY in payload:
-		payload[METADATA_KEY].pop("local_ignored_urls", None)
-		if not payload[METADATA_KEY]:
-			payload.pop(METADATA_KEY, None)
-
+	stripLocalSyncMetadata(payload)
 	return payload
 
 
@@ -2500,79 +2900,170 @@ def pushRemoteData(sourceType, conf, payload, previousSha=None):
 def performSync(pluginInstance=None):
 	"""
 	تنفيذ دورة المزامنة السحابية وفق سياسة سيادة السحابة وصلاحيات المستخدم:
-	1. منع التزامن المتعدد بواسطة syncLock غير معطل للواجهة.
-	2. استيراد المحذوفات السحابية وتطهير البيانات المحلية منها.
-	3. دمج البيانات السحابية مع تفوق السحابة في التحديث المركزي.
-	4. بناء حمولة الرفع حسب صلاحية المستخدم (Central Authority أو Collaborator).
-	5. معالجة تعارضات المستودع (409/422) بإعادة المحاولة لمرة واحدة بـ SHA حديث.
+	1. منع التزامن المتعدد بواسطة syncLock.
+	2. للمالك في Online Design Mode (أو عند وجود تعديلات معلقة): دمج تغييرات المالك مع أحدث بيانات سحابية وحفظ baseline ومسح pending فقط بعد نجاح Push.
+	3. للمتعاون: رفع البرامج الجديدة فقط وعدم تعديل السحابة.
+	4. معالجة تعارضات المستودع (409/422) بإعادة الجلب وحساب الدمج ببيانات حديثة قبل إعادة المحاولة.
 	"""
 	if not config.conf["qadreen"]["onlineMode"]:
-		return
+		return False
 
 	if not syncLock.acquire(blocking=False):
 		log.info("Qadreen: Sync is already in progress, skipping overlapping execution.")
-		return
+		return False
 
 	try:
 		sourceType = config.conf["qadreen"]["sourceType"]
 		qadreenConf = config.conf["qadreen"]
 
+		localData = loadData()
+		hasPending = hasPendingOwnerSync(localData)
+		lastSynced = getLastSyncedData(localData)
+
 		isCentralAuthority = bool(
-			pluginInstance
-			and getattr(pluginInstance, "isRepoOwner", False)
-			and getattr(pluginInstance, "onlineDesignMode", False)
+			(
+				pluginInstance
+				and getattr(pluginInstance, "isRepoOwner", False)
+				and getattr(pluginInstance, "onlineDesignMode", False)
+			)
+			or hasPending
 		)
 
-		cloudData, sha = fetchRemoteData(sourceType, qadreenConf)
-		if cloudData is None:
-			return
+		if isCentralAuthority:
+			# ========================================================
+			# مسار المالك المركزي (Owner في Online Design Mode أو Pending Changes)
+			# ========================================================
+			# اكتشاف التعديلات المحلية للمالك أولاً قبل أي جلب أو دمج
+			initialOwnerChanges = detectOwnerLocalChanges(lastSynced, localData) if lastSynced else None
 
-		localData = loadData()
+			cloudData, sha = fetchRemoteData(sourceType, qadreenConf)
+			if cloudData is None:
+				log.error("Qadreen: Failed to fetch remote data.")
+				return False
 
-		# استيراد المحذوفات السحابية المركزية إلى السجلات المحلية وتطهير localData منها
-		remoteTombstones = getCloudDeleted(cloudData)
-		for item in remoteTombstones:
-			url = item.get("url", "").strip()
-			if url:
-				addCloudDeleted(localData, url, item.get("name", ""), item.get("group", ""), item.get("category", ""))
+			# 1. استيراد المحذوفات السحابية المركزية
+			remoteTombstones = getCloudDeleted(cloudData)
+			for item in remoteTombstones:
+				url = item.get("url", "").strip()
+				if url:
+					addCloudDeleted(localData, url, item.get("name", ""), item.get("group", ""), item.get("category", ""))
 
-		allTombstones = set(item.get("url", "").strip() for item in getCloudDeleted(localData))
-		removeSoftwareByUrls(localData, allTombstones)
+			# 2. تحديد تغييرات المالك النهائية
+			ownerChanges = initialOwnerChanges if initialOwnerChanges is not None else detectOwnerLocalChanges(None, localData, cloudData)
 
-		# دمج البيانات السحابية وفق قاعدة Cloud is the Boss
-		mergeCloudToLocal(localData, cloudData)
-		saveData(localData)
-		if pluginInstance is not None:
-			pluginInstance.data = localData
+			# 3. بناء حمولة الرفع النهائية (Cloud Data + Owner Changes - Tombstones)
+			payload = buildSyncPayload(cloudData, localData, isCentralAuthority=True, ownerChanges=ownerChanges)
 
-		payload = buildSyncPayload(cloudData, localData, isCentralAuthority)
+			# 4. الرفع إلى السحابة مع معالجة التعارض
+			pushSuccess = False
+			try:
+				pushRemoteData(sourceType, qadreenConf, payload, sha)
+				pushSuccess = True
+			except urllib.error.HTTPError as e:
+				if sourceType == "repo" and e.code in (409, 422):
+					log.info("Qadreen: Remote conflict (%s), retrying sync once with fresh SHA", e.code)
+					freshCloud, freshSha = fetchRemoteData(sourceType, qadreenConf)
+					if freshCloud is not None:
+						for item in getCloudDeleted(freshCloud):
+							u = item.get("url", "").strip()
+							if u:
+								addCloudDeleted(localData, u, item.get("name", ""), item.get("group", ""), item.get("category", ""))
+						freshOwnerChanges = detectOwnerLocalChanges(lastSynced, localData, freshCloud)
+						payload = buildSyncPayload(freshCloud, localData, isCentralAuthority=True, ownerChanges=freshOwnerChanges)
+						pushRemoteData(sourceType, qadreenConf, payload, freshSha)
+						pushSuccess = True
+				else:
+					raise
 
-		try:
-			pushRemoteData(sourceType, qadreenConf, payload, sha)
-		except urllib.error.HTTPError as e:
-			if sourceType == "repo" and e.code in (409, 422):
-				log.info("Qadreen: Remote conflict (%s), retrying sync once with fresh SHA", e.code)
-				cloudData, sha = fetchRemoteData(sourceType, qadreenConf)
-				if cloudData is not None:
-					remoteTombstones = getCloudDeleted(cloudData)
-					for item in remoteTombstones:
-						url = item.get("url", "").strip()
-						if url:
-							addCloudDeleted(localData, url, item.get("name", ""), item.get("group", ""), item.get("category", ""))
-					allTombstones = set(item.get("url", "").strip() for item in getCloudDeleted(localData))
-					removeSoftwareByUrls(localData, allTombstones)
-					mergeCloudToLocal(localData, cloudData)
-					saveData(localData)
-					if pluginInstance is not None:
-						pluginInstance.data = localData
-					payload = buildSyncPayload(cloudData, localData, isCentralAuthority)
-					pushRemoteData(sourceType, qadreenConf, payload, sha)
-			else:
-				raise
+			# 5. فقط إذا نجح الرفع فعلياً: تحديث baseline ومسح pending flag وحفظ الحالة محلياً
+			if pushSuccess:
+				finalLocal = copy.deepcopy(payload)
+				finalMeta = finalLocal.setdefault(METADATA_KEY, {})
+				finalMeta["shared_items"] = getSharedItems(localData)
+				finalMeta["local_ignored_urls"] = getLocalIgnored(localData)
+				finalMeta["cloud_deleted_urls"] = getCloudDeleted(localData)
+				setLastSyncedData(finalLocal, payload)
+				setPendingOwnerSync(finalLocal, False)
+
+				saveData(finalLocal)
+				if pluginInstance is not None:
+					pluginInstance.data = finalLocal
+					if getattr(pluginInstance, "_dialog", None) is not None:
+						try:
+							wx.CallAfter(pluginInstance._dialog.updateDataFromPlugin)
+						except Exception:
+							pass
+				return True
+			return False
+
+		else:
+			# ========================================================
+			# مسار المتعاون (Collaborator)
+			# ========================================================
+			cloudData, sha = fetchRemoteData(sourceType, qadreenConf)
+			if cloudData is None:
+				log.error("Qadreen: Failed to fetch remote data.")
+				return False
+
+			remoteTombstones = getCloudDeleted(cloudData)
+			for item in remoteTombstones:
+				url = item.get("url", "").strip()
+				if url:
+					addCloudDeleted(localData, url, item.get("name", ""), item.get("group", ""), item.get("category", ""))
+
+			allTombstones = set(item.get("url", "").strip() for item in getCloudDeleted(localData))
+			removeSoftwareByUrls(localData, allTombstones)
+
+			mergeCloudToLocal(localData, cloudData)
+			saveData(localData)
+			if pluginInstance is not None:
+				pluginInstance.data = localData
+				if getattr(pluginInstance, "_dialog", None) is not None:
+					try:
+						wx.CallAfter(pluginInstance._dialog.updateDataFromPlugin)
+					except Exception:
+						pass
+
+			payload = buildSyncPayload(cloudData, localData, isCentralAuthority=False)
+
+			pushSuccess = False
+			try:
+				pushRemoteData(sourceType, qadreenConf, payload, sha)
+				pushSuccess = True
+			except urllib.error.HTTPError as e:
+				if sourceType == "repo" and e.code in (409, 422):
+					log.info("Qadreen: Remote conflict (%s), retrying sync once with fresh SHA", e.code)
+					cloudData, sha = fetchRemoteData(sourceType, qadreenConf)
+					if cloudData is not None:
+						remoteTombstones = getCloudDeleted(cloudData)
+						for item in remoteTombstones:
+							url = item.get("url", "").strip()
+							if url:
+								addCloudDeleted(localData, url, item.get("name", ""), item.get("group", ""), item.get("category", ""))
+						allTombstones = set(item.get("url", "").strip() for item in getCloudDeleted(localData))
+						removeSoftwareByUrls(localData, allTombstones)
+						mergeCloudToLocal(localData, cloudData)
+						saveData(localData)
+						if pluginInstance is not None:
+							pluginInstance.data = localData
+							if getattr(pluginInstance, "_dialog", None) is not None:
+								try:
+									wx.CallAfter(pluginInstance._dialog.updateDataFromPlugin)
+								except Exception:
+									pass
+						payload = buildSyncPayload(cloudData, localData, isCentralAuthority=False)
+						pushRemoteData(sourceType, qadreenConf, payload, sha)
+						pushSuccess = True
+				else:
+					raise
+			return pushSuccess
+
 	except Exception as e:
 		log.error("Qadreen: performSync encountered an error: %s", e, exc_info=True)
+		return False
 	finally:
 		syncLock.release()
+
 
 
 def runSyncCycle(pluginInstance):
@@ -2726,6 +3217,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		if self.onlineDesignMode:
 			self.onlineDesignMode = False
 			ui.message(tr("msgOnlineDesignModeDisabled"))
+			if getattr(self, "_dialog", None) is not None:
+				try:
+					wx.CallAfter(self._dialog._updateSyncNowButtonVisibility)
+				except Exception:
+					pass
 			return
 
 		if self._authInProgress:
@@ -2755,16 +3251,31 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			self.isRepoOwner = True
 			self.onlineDesignMode = True
 			ui.message(tr("msgOnlineDesignModeEnabled"))
+			if getattr(self, "_dialog", None) is not None:
+				try:
+					wx.CallAfter(self._dialog._updateSyncNowButtonVisibility)
+				except Exception:
+					pass
 			if config.conf["qadreen"]["onlineMode"]:
 				threading.Thread(target=performSync, args=(self,), daemon=True).start()
 		elif reason == "collaborator":
 			self.isRepoOwner = False
 			self.onlineDesignMode = False
 			ui.message(tr("msgOwnerOnly"))
+			if getattr(self, "_dialog", None) is not None:
+				try:
+					wx.CallAfter(self._dialog._updateSyncNowButtonVisibility)
+				except Exception:
+					pass
 		else:
 			self.isRepoOwner = False
 			self.onlineDesignMode = False
 			ui.message(tr("msgAuthFailed"))
+			if getattr(self, "_dialog", None) is not None:
+				try:
+					wx.CallAfter(self._dialog._updateSyncNowButtonVisibility)
+				except Exception:
+					pass
 
 	def terminate(self, *args, **kwargs):
 		self._isTerminated = True

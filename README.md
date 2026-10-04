@@ -4,9 +4,12 @@ An advanced NVDA add-on designed for the Qadreen community, providing robust clo
 
 ## Features
 
-- **Non-Blocking Cloud Synchronization:** Automatic background synchronization with a designated GitHub repository without blocking the NVDA main/UI thread.
+- **Transactional Cloud Synchronization Engine:** Robust, non-blocking background sync powered by a 3-way merge engine and pending-state tracking. Local changes by repository owners are strictly protected against restart overwrite or data loss.
+- **On-Demand Manual Sync:** Dedicated "Sync Now" button inside the main search dialog for repository owners in Central Online Design Mode, providing instantaneous atomic pushes to GitHub.
+- **Automated Conflict Resolution:** Native handling of HTTP 409/422 conflicts via automatic remote re-fetch and delta recalculation without interrupting user workflow.
+- **Collaborator Contribution Support:** Safe multi-user workflow allowing designated collaborators to contribute new software entries without risking repository structure or owner-managed records.
 - **Secure Credential Storage:** Sensitive GitHub Personal Access Tokens (PAT) are encrypted at rest using the Windows Data Protection API (DPAPI).
-- **Cloud Design Mode:** Dedicated supervisor mode enabling authorized repository owners to add, configure, and publish software resources directly via standard dialogs.
+- **Cloud Design Mode:** Dedicated supervisor mode enabling authorized repository owners to add, configure, move, and publish software resources directly via standard dialogs.
 - **Accessible UI Architecture:** Interface elements built with `gui.guiHelper` adhering strictly to NVDA core standards, supporting high-DPI scaling and responsive screen-reader focus routing.
 - **Independent Localization:** Built-in multi-language engine supporting dynamic language switching (Arabic, English, or NVDA system match).
 
